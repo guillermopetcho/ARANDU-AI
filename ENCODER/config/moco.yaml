@@ -1,0 +1,34 @@
+training:
+  seed: 42
+  epochs: 200
+  warmup_epochs: 5
+  batch_size: 48
+  grad_accum_steps: 4
+  num_workers: 4
+  lr_base: 0.03
+  weight_decay: 1e-4
+  use_amp: True
+  save_every: 10
+  early_stopping_patience: 15
+
+moco:
+  dim: 256
+  queue: 16384
+  momentum_base: 0.996
+  temp_start: 0.15
+  temp_end: 0.08
+  temp_warmup_steps: 100 # 🔥 Nuevo: Calentamiento térmico en lugar del hack loss=0
+
+paths:
+  dataset_root: "/kaggle/input/datasets/joaquinignaciopetcho/base-soja-encoder-full/BASE-SOJA-ENCODER-FULL"
+  eval_train_root: "/kaggle/input/datasets/joaquinignaciopetcho/base-soja-encoder-full/BASE-SOJA-ENCODER-FULL/train"
+  eval_val_root: "/kaggle/input/datasets/joaquinignaciopetcho/base-soja-encoder-full/BASE-SOJA-ENCODER-FULL/val"
+  checkpoint_path: "/kaggle/working/moco_checkpoint.pth"
+  best_checkpoint_path: "/kaggle/working/moco_best_checkpoint.pth"
+  encoder_export_path: "/kaggle/working/moco_encoder_ready.pth"
+  metrics_path: "/kaggle/working/ssl_metrics.json"
+  index_cache_path: "/kaggle/working/train_index.npy"
+
+eval:
+  subset_size: 1000
+  knn_k: 20
