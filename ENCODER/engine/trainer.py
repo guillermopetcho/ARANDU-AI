@@ -58,7 +58,13 @@ class MoCoTrainer:
                     labels = torch.zeros(logits.shape[0], dtype=torch.long, device=self.device)
                     loss = F.cross_entropy(logits, labels)
 
-                if not torch.isfinite(loss):
+                is_finite = torch.tensor(1 if torch.isfinite(loss) else 0, device=self.device)
+                if self.is_distributed:
+                    dist.all_reduce(is_finite, op=dist.ReduceOp.MIN)
+
+                if is_finite.item() == 0:
+                    dummy_loss = (q.sum() * 0.0)
+                    self.scaler.scale(dummy_loss).backward()
                     self.optimizer.zero_grad(set_to_none=True)
                     continue
 

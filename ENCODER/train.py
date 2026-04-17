@@ -39,7 +39,7 @@ def main():
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    with open("config/config.yaml", "r") as f:
+    with open("config/moco.yaml", "r") as f:
         CONFIG = yaml.safe_load(f)
 
     eff_batch = CONFIG["training"]["batch_size"] * CONFIG["training"]["grad_accum_steps"] * world_size
@@ -91,7 +91,7 @@ def main():
     if is_distributed: model_q = nn.parallel.DistributedDataParallel(model_q, device_ids=[local_rank])
     queue = MoCoQueue(dim=CONFIG["moco"]["dim"], K=CONFIG["moco"]["queue"]).to(device)
 
-    optimizer = torch.optim.SGD(model_q.parameters(), lr=lr, momentum=0.9, weight_decay=CONFIG["training"]["weight_decay"])
+    optimizer = torch.optim.SGD(model_q.parameters(), lr=lr, momentum=0.9, weight_decay=float(CONFIG["training"]["weight_decay"]))
     scaler = GradScaler(enabled=CONFIG["training"]["use_amp"])
     
     total_steps = CONFIG["training"]["epochs"] * math.ceil(len(train_loader) / CONFIG["training"]["grad_accum_steps"])
@@ -109,6 +109,21 @@ def main():
     start_epoch, global_step = 0, 0
     best_acc, patience = 0.0, 0
     log_buffer = []
+    stop_signal = torch.tensor(0, device=device)
+    
+    ckpt_path = CONFIG["paths"].get("checkpoint_path", "")
+    if ckpt_path and os.path.exists(ckpt_path):
+        if rank == 0: logger.info(f"🔄 Reanudando entrenamiento desde {ckpt_path}")
+        ckpt = torch.load(ckpt_path, map_location="cpu")
+        model_q.load_state_dict(ckpt["model_q"])
+        model_k.load_state_dict(ckpt["model_k"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        scheduler.load_state_dict(ckpt["scheduler"])
+        scaler.load_state_dict(ckpt["scaler"])
+        queue.load_state_dict(ckpt["queue"])
+        start_epoch = ckpt["epoch"] + 1
+        global_step = ckpt["global_step"]
+        best_acc = ckpt.get("best_acc", 0.0)
     log_file = CONFIG["paths"]["metrics_path"].replace('.json', '_log.csv')
 
     if rank == 0 and not os.path.exists(log_file):
@@ -131,13 +146,15 @@ def main():
                 
                 logger.info(f"KNN ACC: {curr_acc:.4f}")
                 
-                ckpt = {
-                    "model_q": model_q.state_dict(), "model_k": model_k.state_dict(),
-                    "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),
-                    "scaler": scaler.state_dict(), "queue": queue.state_dict(),
-                    "epoch": epoch, "global_step": global_step, "best_acc": best_acc
-                }
-                
+            ckpt = {
+                "model_q": model_q.state_dict(), "model_k": model_k.state_dict(),
+                "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),
+                "scaler": scaler.state_dict(), "queue": queue.state_dict(),
+                "epoch": epoch, "global_step": global_step, "best_acc": best_acc
+            }
+            torch.save(ckpt, CONFIG["paths"]["checkpoint_path"])
+            
+            if (epoch + 1) % 5 == 0:
                 if curr_acc > best_acc:
                     best_acc = curr_acc
                     patience = 0
@@ -147,7 +164,7 @@ def main():
                     patience += 1
                     if patience >= CONFIG["training"]["early_stopping_patience"]:
                         logger.warning("⛔ Early Stopping")
-                        break
+                        stop_signal.fill_(1)
 
             log_buffer.append([
                 epoch+1, metrics['loss'], optimizer.param_groups[0]['lr'], curr_acc,
@@ -159,7 +176,16 @@ def main():
                 with open(log_file, "a", newline="") as f: csv.writer(f).writerows(log_buffer)
                 log_buffer.clear()
                 
+                
             logger.info(f"Ep {epoch+1} | Loss {metrics['loss']:.3f} | U: {metrics['unif']:.2f} | LR: {optimizer.param_groups[0]['lr']:.4f}")
+
+        if is_distributed:
+            dist.broadcast(stop_signal, src=0)
+        
+        if stop_signal.item() == 1:
+            break
+
+    if is_distributed: dist.destroy_process_group()
 
     if rank == 0:
         if log_buffer:
@@ -167,8 +193,12 @@ def main():
         
         logger.info("Iniciando Linear Probe...")
         best_ckpt = torch.load(CONFIG["paths"]["best_checkpoint_path"], map_location=device)
-        clean_enc = {k[8:] if k.startswith("encoder.") else (k[7:] if k.startswith("module.") else k): v 
-                     for k, v in best_ckpt["model_q"].items() if "encoder" in k or "module" in k}
+        clean_enc = {}
+        for k, v in best_ckpt["model_q"].items():
+            if k.startswith("module.encoder."):
+                clean_enc[k.replace("module.encoder.", "")] = v
+            elif k.startswith("encoder."):
+                clean_enc[k.replace("encoder.", "")] = v
         
         eval_enc = models.resnet50(weights=None); eval_enc.fc = nn.Identity()
         eval_enc.load_state_dict(clean_enc, strict=False)
@@ -180,8 +210,6 @@ def main():
         torch.save(clean_enc, CONFIG["paths"]["encoder_export_path"])
         with open(CONFIG["paths"]["metrics_path"], "w") as f: json.dump({"acc": acc, "f1": f1}, f, indent=4)
         logger.info("✅ Listo.")
-
-    if is_distributed: dist.destroy_process_group()
 
 if __name__ == "__main__":
     main()

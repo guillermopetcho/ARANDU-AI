@@ -65,7 +65,7 @@ class MoCoDataset(Dataset):
 def build_index(root, rank, cache_path):
     if os.path.exists(cache_path):
         return np.load(cache_path).tolist()
-    files = [str(f) for ext in ["*.jpg", "*.png", "*.jpeg"] for f in Path(root).rglob(ext)]
+    files = sorted([str(f) for ext in ["*.jpg", "*.png", "*.jpeg"] for f in Path(root).rglob(ext)])
     if len(files) == 0: raise RuntimeError(f"No imágenes en {root}")
     if rank == 0: np.save(cache_path, files)
     return files
