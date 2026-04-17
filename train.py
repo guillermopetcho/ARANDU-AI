@@ -112,9 +112,17 @@ def main():
     stop_signal = torch.tensor(0, device=device)
     
     ckpt_path = CONFIG["paths"].get("checkpoint_path", "")
+    best_ckpt_path = CONFIG["paths"].get("best_checkpoint_path", "")
+    
+    ckpt_to_load = None
     if ckpt_path and os.path.exists(ckpt_path):
-        if rank == 0: logger.info(f"🔄 Reanudando entrenamiento desde {ckpt_path}")
-        ckpt = torch.load(ckpt_path, map_location="cpu")
+        ckpt_to_load = ckpt_path
+    elif best_ckpt_path and os.path.exists(best_ckpt_path):
+        ckpt_to_load = best_ckpt_path
+        
+    if ckpt_to_load:
+        if rank == 0: logger.info(f"🔄 Reanudando entrenamiento desde {ckpt_to_load}")
+        ckpt = torch.load(ckpt_to_load, map_location="cpu")
         model_q.load_state_dict(ckpt["model_q"])
         model_k.load_state_dict(ckpt["model_k"])
         optimizer.load_state_dict(ckpt["optimizer"])
