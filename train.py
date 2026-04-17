@@ -16,6 +16,7 @@ from torchvision.datasets import ImageFolder
 from torchvision import transforms as T
 from torchvision import models
 
+
 from models.moco import ModelBase, MoCoQueue, build_index, MoCoDataset
 from engine.trainer import MoCoTrainer
 from evaluation.knn import extract_features_fast, fast_knn
