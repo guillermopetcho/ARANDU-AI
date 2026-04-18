@@ -28,6 +28,8 @@ El procesamiento de imágenes está fuertemente enfocado en perturbaciones visua
 
 El dataset de PyTorch personalizado (`MoCoDataset`) incluye un mecanismo de tolerancia a fallos: si una imagen está corrupta o no se puede abrir, el dataloader reintenta cargar otras imágenes aleatorias del conjunto para evitar que el flujo de entrenamiento se detenga de forma abrupta por errores de I/O.
 
+![imagen](https://github.com/guillermopetcho/ARANDU-AI/blob/main/imagenes-ENCODER/Pipeline%20de%20Datos%20y%20Augmentaciones.png)
+
 ---
 
 ## 3. Motor de Entrenamiento (MoCoTrainer)
@@ -38,6 +40,9 @@ Ubicado en `engine/trainer.py` y orquestado por el script principal `train.py`, 
 *   **Acumulación de Gradientes:** Permite simular lotes (batches) efectivos mucho más grandes acumulando gradientes a través de varios micro-lotes (por defecto 4) antes de actualizar los pesos de la red neuronal.
 *   **Optimizador y Planificador de Tasa de Aprendizaje:** Usa descenso de gradiente estocástico (`SGD`) combinado con un planificador que aplica un "calentamiento lineal" (Linear Warmup) seguido de un decaimiento suave en forma de curva coseno (`CosineAnnealingLR`).
 
+![imagen](https://github.com/guillermopetcho/ARANDU-AI/blob/main/imagenes-ENCODER/Motor%20de%20Entrenamiento%20(MoCoTrainer).png)
+
+
 ---
 
 ## 4. Innovaciones Algorítmicas: Auto-Regulación Termodinámica
@@ -45,6 +50,8 @@ Un aspecto técnico distintivo del código se encuentra en `engine/scheduler.py`
 
 *   **Calentamiento Térmico (Temp Warmup):** Al arrancar el entrenamiento, el sistema impone una temperatura artificialmente alta (`0.5`). Esto diluye artificialmente el contraste, suavizando y estabilizando los primeros gradientes que recibe la red, reduciendo la temperatura gradualmente a medida que avanza.
 *   **Prevención de Colapso (Basada en Uniformidad):** Durante el proceso se monitorea matemáticamente la métrica de **uniformidad** espacial de los embeddings. Si el sistema detecta que los vectores están perdiendo diversidad y empezando a agruparse excesivamente en un mismo lugar (uniformidad muy negativa, `< -4.0`), interviene automáticamente aplicando un *"Temp Boost"* (aumento repentino de temperatura para forzar repulsión entre vectores) y acelera la renovación de la cola de memoria bajando el momentum temporalmente a `0.99`. Esto permite "purgar" la basura de la cola y recuperar la red.
+
+![imagen](https://github.com/guillermopetcho/ARANDU-AI/blob/main/imagenes-ENCODER/Innovaciones%20Algor%C3%ADtmicas%3A%20Auto-Regulaci%C3%B3n%20Termodin%C3%A1mica.png)
 
 ---
 
@@ -55,6 +62,8 @@ El modelo incluye módulos analíticos para medir su calidad en vuelo sin interr
 *   **Métricas Internas Explicativas:** El sistema expone constantemente el nivel de **Alineación** (qué tan cerca quedan las vistas idénticas) y **Uniformidad** (qué tan dispersos están todos los datos entre sí en el hiperespacio).
 *   **Linear Probing Definitivo:** Al final de la rutina de entrenamiento de MoCo, un protocolo estandarizado (`evaluation/linear_probe.py`) congela por completo los pesos del encoder recién entrenado y acopla un perceptrón lineal clásico, entrenándolo velozmente y exportando el cabezal junto a las métricas definitivas (`Accuracy` y `F1-Score`).
 
+![imagen](https://github.com/guillermopetcho/ARANDU-AI/blob/main/imagenes-ENCODER/Evaluaci%C3%B3n%20Continua%20y%20Seguimiento.png)
+
 ---
 
 ## 6. Sistema de Checkpoints Inteligente
@@ -63,10 +72,11 @@ El código (`train.py`) se caracteriza por un bloque de manejo de interrupciones
 *   Si existe, restaura de forma hermética todo el estado: el modelo principal, el modelo llave (Key), los contadores del optimizador, del scheduler, del scaler y, lo más importante, la matriz de la cola de MoCo, continuando la reanudación desde la misma época y bloque de iteración exactos en los que quedó pausado.
 *   Incluye un disparador de paro prematuro (*Early Stopping*), el cual se encuentra completamente sincronizado a través de todas las GPUs (`dist.broadcast`) para evitar procesos colgados o *deadlocks*.
 
+![imagen](https://github.com/guillermopetcho/ARANDU-AI/blob/main/imagenes-ENCODER/Sistema%20de%20Checkpoints%20Inteligente.png)
+
 ---
 
-
-
+## 7. Guía Rápida de Optimización de Hiperparámetros
 Para obtener el máximo rendimiento tanto en **eficiencia computacional** (uso de hardware/tiempo) como en **aprendizaje** (calidad de los embeddings) en `config/moco.yaml`. 
 
 Estas recomendaciones están basadas en los estándares de la industria para arquitecturas *Momentum Contrast (MoCo)* entrenadas sobre redes ResNet-50.
