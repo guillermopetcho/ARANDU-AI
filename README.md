@@ -14,7 +14,7 @@ El modelo se define principalmente en `models/moco.py` y se compone de tres elem
 *   **Proyector MLP:** Una red neuronal perceptrón multicapa de 3 capas ocultas (`2048 -> 2048 -> 2048 -> 256`) con *Batch Normalization* y activaciones ReLU, que mapea las características a un espacio de menor dimensión (`dim=256`) donde se calcula el contraste.
 *   **Cola de Memoria (MoCoQueue):** Una estructura de datos de tamaño fijo (`K=16384`) que almacena de manera eficiente representaciones de iteraciones pasadas para actuar como "ejemplos negativos" abundantes durante el entrenamiento, separando el tamaño del lote (batch) del número de ejemplos negativos.
 
-![imagen](imagenes-ENCODER/Arquitectura del Modelo.png)
+![imagen](https://github.com/guillermopetcho/ARANDU-AI/blob/main/imagenes-ENCODER/Arquitectura%20del%20Modelo.png)
 
 ---
 
