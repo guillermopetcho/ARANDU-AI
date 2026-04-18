@@ -84,13 +84,14 @@ class ModelBase(nn.Module):
             nn.BatchNorm1d(2048),
             nn.ReLU(inplace=True),
             nn.Linear(2048, dim),
-            nn.BatchNorm1d(dim)
+            nn.BatchNorm1d(dim, affine=False)
         )
 
     def forward(self, x):
         h = self.encoder(x)
         z = self.projector(h)
-        return F.normalize(z, dim=1)
+        # Force float32 for L2 norm to prevent FP16 overflow (inf), which causes NaNs.
+        return F.normalize(z.float(), dim=1).to(z.dtype)
 
 class MoCoQueue(nn.Module):
     def __init__(self, dim=256, K=32768):
