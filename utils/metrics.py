@@ -11,7 +11,7 @@ def compute_uniformity(q, t=2):
     sample_size = min(64, q.shape[0])
     q_sample = q[torch.randperm(q.shape[0])[:sample_size]]
     # Log-Sum-Exp trick para estabilidad numérica
-    sq_dist = torch.pdist(q_sample, p=2).pow(2)
+    sq_dist = torch.pdist(q_sample.float(), p=2).pow(2)
     return torch.log(torch.exp(-t * sq_dist).mean() + 1e-8)
 
 def compute_metrics(q, k):
@@ -22,7 +22,7 @@ def compute_metrics(q, k):
         if q.shape[0] > 1:
             sample_size = min(64, q.shape[0])
             sample_q = q[torch.randperm(q.shape[0])[:sample_size]]
-            u = torch.exp(-2 * torch.pdist(sample_q, p=2).pow(2))
+            u = torch.exp(-2 * torch.pdist(sample_q.float(), p=2).pow(2))
             metrics['uniformity'] = torch.log(u.mean() + 1e-8).item()
         else:
             metrics['uniformity'] = 0.0
