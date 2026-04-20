@@ -142,12 +142,17 @@ def main():
         warmup_aborted = ckpt.get("warmup_aborted", False)
         global_step = ckpt.get("global_step", 0) # 🔥 Fix: Cargar ANTES de usarlo en el scheduler
         
-        # Reconstruir scheduler exactamente con la misma arquitectura con la que se guardó
-        scheduler = build_scheduler(optimizer, warmup_steps, total_steps, global_step, skip=warmup_aborted)
+        is_cosine_phase = (warmup_aborted or global_step >= warmup_steps)
+        
+        # Reconstruir scheduler exactamente con la arquitectura que necesitamos AHORA
+        scheduler = build_scheduler(optimizer, warmup_steps, total_steps, c_step=global_step, skip=is_cosine_phase)
             
-        # ❗ Cargar el estado SIEMPRE es correcto aquí porque si warmup_aborted=True, 
-        # el checkpoint guardó un CosineAnnealingLR y debemos restaurar su 'last_epoch'.
-        scheduler.load_state_dict(ckpt["scheduler"])
+        # 🔥 FIX CRÍTICO: No cargar el state_dict si cruzamos a la fase Cosine o si cambiamos config
+        if not is_cosine_phase:
+            try:
+                scheduler.load_state_dict(ckpt["scheduler"])
+            except Exception:
+                if rank == 0: logger.warning("No se pudo cargar el state_dict del scheduler. Usando configuración limpia.")
         scaler.load_state_dict(ckpt["scaler"])
         queue.load_state_dict(ckpt["queue"])
         start_epoch = ckpt["epoch"] + 1
