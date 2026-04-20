@@ -1,7 +1,7 @@
 training:
   seed: 42
   epochs: 200
-  warmup_epochs: 15
+  warmup_epochs: 5
   batch_size: 48
   grad_accum_steps: 4
   num_workers: 4
