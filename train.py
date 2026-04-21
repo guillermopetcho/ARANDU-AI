@@ -22,6 +22,8 @@ from engine.scheduler import build_scheduler
 from engine.controller import TrainingController, Action
 from evaluation.knn import extract_features_fast, fast_knn
 from evaluation.linear_probe import run_linear_probe
+from models.moco import build_index, MoCoDataset, ModelBase, MoCoQueue
+
 
 def get_model_module(model, is_distributed):
     return model.module if is_distributed else model
