@@ -1,14 +1,22 @@
 import torch
 
+import math
+
 def build_scheduler(opt, w_steps, t_steps, c_step=0, skip=False):
     if skip:
-        return torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, t_steps - c_step))
-    return torch.optim.lr_scheduler.SequentialLR(
-        opt, schedulers=[
-            torch.optim.lr_scheduler.LinearLR(opt, start_factor=0.01, total_iters=w_steps),
-            torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, t_steps - w_steps))
-        ], milestones=[w_steps]
-    )
+        def lr_lambda(step):
+            progress = step / max(1, t_steps - c_step)
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+        return torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
+        
+    def lr_lambda(step):
+        if step < w_steps:
+            return 0.01 + 0.99 * (step / max(1, w_steps))
+        else:
+            progress = (step - w_steps) / max(1, t_steps - w_steps)
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+            
+    return torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
 
 @torch.no_grad()
 def momentum_update(model_q, model_k, m):
