@@ -78,6 +78,10 @@ def main():
     if rank == 0 and use_wandb:
         try:
             import wandb
+            # 🔥 FIX: Prevenir que WandB pida login interactivo y bloquee el Rank 0
+            if not os.environ.get("WANDB_API_KEY"):
+                os.environ["WANDB_MODE"] = "offline"
+                
             wandb.init(
                 project=CONFIG.get("wandb", {}).get("project", "MoCo-ENCODER"),
                 config=CONFIG,
