@@ -46,21 +46,39 @@ class MoCoTrainer:
 
             with sync_context:
                 with autocast("cuda", enabled=self.config['training']['use_amp']):
-                    q = self.model_q(v_q)
+                    # View 1
+                    q1 = self.model_q(v_q)
                     with torch.no_grad():
                         if self.is_distributed:
-                            v_k, idx_shuffle = batch_shuffle_ddp(v_k)
-                            k = self.model_k(v_k)
-                            k = batch_unshuffle_ddp(k, idx_shuffle)
+                            v_k_shuffled, idx_shuffle1 = batch_shuffle_ddp(v_k)
+                            k1 = self.model_k(v_k_shuffled)
+                            k1 = batch_unshuffle_ddp(k1, idx_shuffle1)
                         else:
-                            k = self.model_k(v_k)
+                            k1 = self.model_k(v_k)
                             
-                    l_pos = torch.einsum('nc,nc->n', [q, k]).unsqueeze(-1)
-                    l_neg = torch.einsum('nc,ck->nk', [q, self.queue.queue.detach()])
-                    logits = torch.cat([l_pos, l_neg], dim=1) / temp
+                    l_pos1 = torch.einsum('nc,nc->n', [q1, k1]).unsqueeze(-1)
+                    l_neg1 = torch.einsum('nc,ck->nk', [q1, self.queue.queue.detach()])
+                    logits1 = torch.cat([l_pos1, l_neg1], dim=1) / temp
+
+                    # View 2
+                    q2 = self.model_q(v_k)
+                    with torch.no_grad():
+                        if self.is_distributed:
+                            v_q_shuffled, idx_shuffle2 = batch_shuffle_ddp(v_q)
+                            k2 = self.model_k(v_q_shuffled)
+                            k2 = batch_unshuffle_ddp(k2, idx_shuffle2)
+                        else:
+                            k2 = self.model_k(v_q)
+
+                    l_pos2 = torch.einsum('nc,nc->n', [q2, k2]).unsqueeze(-1)
+                    l_neg2 = torch.einsum('nc,ck->nk', [q2, self.queue.queue.detach()])
+                    logits2 = torch.cat([l_pos2, l_neg2], dim=1) / temp
                     
-                    labels = torch.zeros(logits.shape[0], dtype=torch.long, device=self.device)
-                    loss = F.cross_entropy(logits, labels)
+                    labels = torch.zeros(logits1.shape[0], dtype=torch.long, device=self.device)
+                    loss = (F.cross_entropy(logits1, labels) + F.cross_entropy(logits2, labels)) * 0.5
+                    
+                    # Aliases para mantener consistencia de métricas y updates
+                    q, k, l_pos, l_neg = q1, k1, l_pos1, l_neg1
 
                 is_finite = torch.tensor(1 if torch.isfinite(loss) else 0, device=self.device)
                 if self.is_distributed:

@@ -74,6 +74,19 @@ def main():
         ch.setFormatter(logging.Formatter("%(asctime)s | %(message)s"))
         logger.addHandler(ch)
 
+    use_wandb = CONFIG.get("wandb", {}).get("enabled", False)
+    if rank == 0 and use_wandb:
+        try:
+            import wandb
+            wandb.init(
+                project=CONFIG.get("wandb", {}).get("project", "MoCo-ENCODER"),
+                config=CONFIG,
+                name=f"run_effbatch_{eff_batch}_lr_{lr:.4f}"
+            )
+        except ImportError:
+            logger.warning("WandB está habilitado en config pero no está instalado. Usando logger estándar.")
+            use_wandb = False
+
     if rank == 0: logger.info(f"Iniciando. EffBatch: {eff_batch}, LR: {lr:.6f}")
 
     seed = CONFIG["training"]["seed"] + rank
@@ -101,6 +114,12 @@ def main():
     eval_val_loader = DataLoader(val_ds, batch_size=128, num_workers=2, pin_memory=True)
 
     model_base = ModelBase(dim=CONFIG["moco"]["dim"]).to(device, memory_format=torch.channels_last)
+    if hasattr(torch, "compile"):
+        try:
+            model_base = torch.compile(model_base)
+        except Exception as e:
+            if rank == 0: logger.warning(f"No se pudo compilar el modelo: {e}")
+            
     if is_distributed: model_base = nn.SyncBatchNorm.convert_sync_batchnorm(model_base)
     
     model_q = copy.deepcopy(model_base)
@@ -231,14 +250,37 @@ def main():
                 with open(log_file, "a", newline="") as f: csv.writer(f).writerows(log_buffer)
                 log_buffer.clear()
                 
-                
             logger.info(f"Ep {epoch+1} | Loss {metrics['loss']:.3f} | U: {metrics['unif']:.2f} | LR: {optimizer.param_groups[0]['lr']:.4f}")
+            
+            if use_wandb:
+                try:
+                    import wandb
+                    wandb.log({
+                        "train/loss": metrics['loss'],
+                        "train/lr": optimizer.param_groups[0]['lr'],
+                        "train/unif": metrics['unif'],
+                        "train/align": metrics['align'],
+                        "train/grad_norm": metrics['gn'],
+                        "train/pos_loss": metrics['pos'],
+                        "train/neg_loss": metrics['neg'],
+                        "train/tput": metrics['tput'],
+                        "eval/knn_acc": curr_acc if curr_acc >= 0 else None,
+                        "epoch": epoch + 1
+                    }, step=global_step)
+                except Exception:
+                    pass
 
         if is_distributed:
             dist.broadcast(stop_signal, src=0)
         
         if stop_signal.item() == 2:
             if rank == 0: logger.info("🔄 Iniciando proceso de Rollback...")
+            if rank == 0 and use_wandb:
+                try:
+                    import wandb
+                    wandb.log({"event/rollback": 1}, step=global_step)
+                except Exception:
+                    pass
             ckpt = torch.load(CONFIG["paths"]["best_checkpoint_path"], map_location="cpu")
             model_q.load_state_dict(ckpt["model_q"])
             model_k.load_state_dict(ckpt["model_k"])
@@ -274,6 +316,13 @@ def main():
             break
 
     if is_distributed: dist.destroy_process_group()
+    
+    if rank == 0 and use_wandb:
+        try:
+            import wandb
+            wandb.finish()
+        except Exception:
+            pass
 
     if rank == 0:
         if log_buffer:
