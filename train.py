@@ -118,9 +118,11 @@ def main():
     eval_val_loader = DataLoader(val_ds, batch_size=128, num_workers=2, pin_memory=True)
 
     model_base = ModelBase(dim=CONFIG["moco"]["dim"]).to(device, memory_format=torch.channels_last)
+    is_compiled = False
     if hasattr(torch, "compile"):
         try:
             model_base = torch.compile(model_base)
+            is_compiled = True
         except Exception as e:
             if rank == 0: logger.warning(f"No se pudo compilar el modelo: {e}")
             
@@ -162,8 +164,18 @@ def main():
     if ckpt_to_load:
         if rank == 0: logger.info(f"🔄 Reanudando entrenamiento desde {ckpt_to_load}")
         ckpt = torch.load(ckpt_to_load, map_location="cpu")
-        model_q.load_state_dict(ckpt["model_q"])
-        model_k.load_state_dict(ckpt["model_k"])
+        
+        def adapt_keys(state_dict, is_ddp=False):
+            new_dict = {}
+            for k, v in state_dict.items():
+                clean_k = k.replace("module.", "").replace("_orig_mod.", "")
+                prefix = "module." if is_ddp else ""
+                if is_compiled: prefix += "_orig_mod."
+                new_dict[prefix + clean_k] = v
+            return new_dict
+
+        model_q.load_state_dict(adapt_keys(ckpt["model_q"], is_distributed), strict=False)
+        model_k.load_state_dict(adapt_keys(ckpt["model_k"], False), strict=False)
         optimizer.load_state_dict(ckpt["optimizer"])
         
         # Cargar estado del controlador o fallback de retrocompatibilidad
@@ -225,8 +237,12 @@ def main():
                 elif action == Action.ROLLBACK:
                     stop_signal.fill_(2)
                     
+            def clean_state_dict_for_save(state_dict):
+                return {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+
             ckpt = {
-                "model_q": model_q.state_dict(), "model_k": model_k.state_dict(),
+                "model_q": clean_state_dict_for_save(model_q.state_dict()), 
+                "model_k": clean_state_dict_for_save(model_k.state_dict()),
                 "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),
                 "scaler": scaler.state_dict(), "queue": queue.state_dict(),
                 "epoch": epoch, "global_step": global_step,
@@ -286,8 +302,8 @@ def main():
                 except Exception:
                     pass
             ckpt = torch.load(CONFIG["paths"]["best_checkpoint_path"], map_location="cpu")
-            model_q.load_state_dict(ckpt["model_q"])
-            model_k.load_state_dict(ckpt["model_k"])
+            model_q.load_state_dict(adapt_keys(ckpt["model_q"], is_distributed), strict=False)
+            model_k.load_state_dict(adapt_keys(ckpt["model_k"], False), strict=False)
             optimizer.load_state_dict(ckpt["optimizer"])
             
             # 🔥 Fix Pro: Bajar el LR a la mitad para estabilizar inmediatamente tras el rollback
@@ -336,10 +352,11 @@ def main():
         best_ckpt = torch.load(CONFIG["paths"]["best_checkpoint_path"], map_location=device)
         clean_enc = {}
         for k, v in best_ckpt["model_q"].items():
-            if k.startswith("module.encoder."):
-                clean_enc[k.replace("module.encoder.", "")] = v
-            elif k.startswith("encoder."):
-                clean_enc[k.replace("encoder.", "")] = v
+            k_clean = k.replace("_orig_mod.", "") # Por si se guardó corrupto antes
+            if k_clean.startswith("module.encoder."):
+                clean_enc[k_clean.replace("module.encoder.", "")] = v
+            elif k_clean.startswith("encoder."):
+                clean_enc[k_clean.replace("encoder.", "")] = v
         
         eval_enc = models.resnet50(weights=None); eval_enc.fc = nn.Identity()
         eval_enc.load_state_dict(clean_enc, strict=False)
