@@ -8,7 +8,7 @@ from tqdm.auto import tqdm
 
 from utils.distributed import batch_shuffle_ddp, batch_unshuffle_ddp
 from utils.metrics import compute_metrics
-from engine.scheduler import get_dynamic_hyperparams, momentum_update
+from engine.scheduler import momentum_update
 
 class MoCoTrainer:
     def __init__(self, model_q, model_k, queue, optimizer, scheduler, scaler, config, device, is_distributed):
@@ -21,6 +21,7 @@ class MoCoTrainer:
         self.config = config
         self.device = device
         self.is_distributed = is_distributed
+        self.controller = config.get('_controller', None) # Se inyecta temporalmente por config o parámetro
         self.last_unif = 0.0 # Tracking para autoregulación
 
     def train_epoch(self, loader, epoch, global_step, total_steps, rank):
@@ -32,8 +33,11 @@ class MoCoTrainer:
         epoch_start = time.time()
 
         for step, (v_q, v_k) in enumerate(pbar):
-            # 🔥 Auto-Regulación Termodinámica
-            momentum, temp = get_dynamic_hyperparams(global_step, total_steps, self.config, self.last_unif)
+            # 🔥 Auto-Regulación Termodinámica via Controller
+            if self.controller:
+                momentum, temp = self.controller.get_dynamic_hyperparams(global_step, total_steps, self.last_unif)
+            else:
+                momentum, temp = 0.996, 0.2 # Fallback si no hay controlador
             
             v_q, v_k = v_q.to(self.device, non_blocking=True, memory_format=torch.channels_last), v_k.to(self.device, non_blocking=True, memory_format=torch.channels_last)
 

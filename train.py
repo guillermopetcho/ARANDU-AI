@@ -17,8 +17,9 @@ from torchvision import transforms as T
 from torchvision import models
 
 
-from models.moco import ModelBase, MoCoQueue, build_index, MoCoDataset
 from engine.trainer import MoCoTrainer
+from engine.scheduler import build_scheduler
+from engine.controller import TrainingController, Action
 from evaluation.knn import extract_features_fast, fast_knn
 from evaluation.linear_probe import run_linear_probe
 
@@ -56,6 +57,10 @@ def main():
     
     with open(config_path, "r") as f:
         CONFIG = yaml.safe_load(f)
+
+    # Inicializar el Controlador Adaptativo
+    controller = TrainingController(CONFIG)
+    CONFIG['_controller'] = controller
 
     eff_batch = CONFIG["training"]["batch_size"] * CONFIG["training"]["grad_accum_steps"] * world_size
     lr = min(CONFIG["training"]["lr_base"] * (eff_batch / 256.0), 0.15) # 🔥 Fix Pro: Cap bajado a 0.15 para mayor estabilidad SSL
@@ -117,10 +122,6 @@ def main():
     trainer = MoCoTrainer(model_q, model_k, queue, optimizer, scheduler, scaler, CONFIG, device, is_distributed)
 
     start_epoch, global_step = 0, 0
-    best_acc, patience = 0.0, 0
-    warmup_aborted = False
-    last_rollback_epoch = -999 # Cooldown para evitar loops de rollback
-    rollback_cooldown = 3
     log_buffer = []
     stop_signal = torch.tensor(0, device=device)
     
@@ -139,10 +140,17 @@ def main():
         model_q.load_state_dict(ckpt["model_q"])
         model_k.load_state_dict(ckpt["model_k"])
         optimizer.load_state_dict(ckpt["optimizer"])
-        warmup_aborted = ckpt.get("warmup_aborted", False)
-        global_step = ckpt.get("global_step", 0) # 🔥 Fix: Cargar ANTES de usarlo en el scheduler
         
-        is_cosine_phase = (warmup_aborted or global_step >= warmup_steps)
+        # Cargar estado del controlador o fallback de retrocompatibilidad
+        if "controller" in ckpt:
+            controller.load_state_dict(ckpt["controller"])
+        else:
+            controller.best_acc = ckpt.get("best_acc", 0.0)
+            controller.warmup_aborted = ckpt.get("warmup_aborted", False)
+            
+        global_step = ckpt.get("global_step", 0)
+        
+        is_cosine_phase = (controller.warmup_aborted or global_step >= warmup_steps)
         
         # Reconstruir scheduler exactamente con la arquitectura que necesitamos AHORA
         scheduler = build_scheduler(optimizer, warmup_steps, total_steps, c_step=global_step, skip=is_cosine_phase)
@@ -156,7 +164,6 @@ def main():
         scaler.load_state_dict(ckpt["scaler"])
         queue.load_state_dict(ckpt["queue"])
         start_epoch = ckpt["epoch"] + 1
-        best_acc = ckpt.get("best_acc", 0.0)
     log_file = CONFIG["paths"]["metrics_path"].replace('.json', '_log.csv')
 
     if rank == 0 and not os.path.exists(log_file):
@@ -170,49 +177,36 @@ def main():
         
         if rank == 0:
             curr_acc = -1
-            is_warmup = (epoch < CONFIG["training"]["warmup_epochs"]) and not warmup_aborted
-            # 🔥 Fix: Evaluar KNN en cada época siempre, es nuestra brújula principal
             eval_freq = 1
 
             if (epoch + 1) % eval_freq == 0:
-                # Sincrónico rápido
                 eval_model = get_model_module(model_q, is_distributed)
                 X_t, y_t = extract_features_fast(eval_model, eval_train_loader, device)
                 X_v, y_v = extract_features_fast(eval_model, eval_val_loader, device)
                 curr_acc = fast_knn(X_t, y_t, X_v, y_v, k=CONFIG["eval"]["knn_k"])
-                
                 logger.info(f"KNN ACC: {curr_acc:.4f}")
                 
-                # 🔥 Lógica de Auto-Revert con threshold dinámico
-                threshold = max(0.02, 0.05 * (1 - best_acc))
-                if is_warmup and best_acc > 0 and curr_acc < (best_acc - threshold):
-                    if (epoch - last_rollback_epoch) > rollback_cooldown:
-                        logger.warning(f"⚠️ Caída catastrófica detectada (KNN {curr_acc:.4f} < Best {best_acc:.4f}). Abortando Warmup y haciendo Rollback!")
-                        stop_signal.fill_(2)
-                        last_rollback_epoch = epoch
-                    else:
-                        logger.info(f"⏳ Ignorando caída (KNN {curr_acc:.4f}), en periodo de cooldown de rollback.")
+                # Delegar decisiones lógicas al Controlador Adaptativo
+                action = controller.step_epoch(epoch, curr_acc, metrics)
+                
+                if action == Action.EARLY_STOP:
+                    stop_signal.fill_(1)
+                elif action == Action.ROLLBACK:
+                    stop_signal.fill_(2)
                     
             ckpt = {
                 "model_q": model_q.state_dict(), "model_k": model_k.state_dict(),
                 "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),
                 "scaler": scaler.state_dict(), "queue": queue.state_dict(),
-                "epoch": epoch, "global_step": global_step, "best_acc": best_acc,
-                "warmup_aborted": warmup_aborted
+                "epoch": epoch, "global_step": global_step,
+                "controller": controller.state_dict()
             }
             torch.save(ckpt, CONFIG["paths"]["checkpoint_path"])
             
             if (epoch + 1) % eval_freq == 0:
-                if curr_acc > best_acc:
-                    best_acc = curr_acc
-                    patience = 0
+                if curr_acc == controller.best_acc and curr_acc > 0:
                     torch.save(ckpt, CONFIG["paths"]["best_checkpoint_path"])
                     logger.info("🏆 Best model guardado")
-                else:
-                    patience += 1
-                    if patience >= CONFIG["training"]["early_stopping_patience"]:
-                        logger.warning("⛔ Early Stopping")
-                        stop_signal.fill_(1)
 
             log_buffer.append([
                 epoch+1, metrics['loss'], optimizer.param_groups[0]['lr'], curr_acc,
@@ -249,7 +243,7 @@ def main():
             scheduler = build_scheduler(optimizer, warmup_steps, total_steps, c_step=global_step, skip=True)
             trainer.scheduler = scheduler # Actualizamos la referencia en el trainer
             
-            warmup_aborted = True
+            controller.warmup_aborted = True
             stop_signal.fill_(0)
             if rank == 0: logger.info("✅ Rollback completado. Abortando Warmup e iniciando fase de Decaimiento Cosenoidal.")
             continue
