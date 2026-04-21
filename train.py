@@ -152,17 +152,23 @@ def main():
             
         global_step = ckpt.get("global_step", 0)
         
-        is_cosine_phase = (controller.warmup_aborted or global_step >= warmup_steps)
-        
-        # Reconstruir scheduler exactamente con la arquitectura que necesitamos AHORA
-        scheduler = build_scheduler(optimizer, warmup_steps, total_steps, c_step=global_step, skip=is_cosine_phase)
+        # 🔥 FIX CRÍTICO: Sanitizar el optimizer state dict que viene del checkpoint
+        # Esto previene que inicializaciones corruptas de schedulers previos o rollbacks 
+        # provoquen que el LR se dispare al instanciar CosineAnnealingLR.
+        for param_group in optimizer.param_groups:
+            param_group['initial_lr'] = lr
+            param_group['lr'] = lr  # Reset para que el scheduler tome control matemáticamente
             
-        # 🔥 FIX CRÍTICO: No cargar el state_dict si cruzamos a la fase Cosine o si cambiamos config
-        if not is_cosine_phase:
-            try:
-                scheduler.load_state_dict(ckpt["scheduler"])
-            except Exception:
-                if rank == 0: logger.warning("No se pudo cargar el state_dict del scheduler. Usando configuración limpia.")
+        # Reconstruir scheduler siempre desde cero y hacer fast-forward determinista
+        # Esto evita incompatibilidades de PyTorch con SequentialLR.load_state_dict()
+        scheduler = build_scheduler(optimizer, warmup_steps, total_steps)
+        
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            for _ in range(global_step):
+                scheduler.step()
+                
         scaler.load_state_dict(ckpt["scaler"])
         queue.load_state_dict(ckpt["queue"])
         start_epoch = ckpt["epoch"] + 1
@@ -234,15 +240,24 @@ def main():
             optimizer.load_state_dict(ckpt["optimizer"])
             
             # 🔥 Fix Pro: Bajar el LR a la mitad para estabilizar inmediatamente tras el rollback
+            # Sanitizamos explícitamente todo el optimizador para la nueva curva térmica
             for param_group in optimizer.param_groups:
-                param_group["lr"] *= 0.5
+                param_group['initial_lr'] = lr * 0.5  # Modificar toda la curva base
+                param_group['lr'] = lr * 0.5
                 
             scaler.load_state_dict(ckpt["scaler"])
             queue.load_state_dict(ckpt["queue"])
             global_step = ckpt["global_step"]
             
-            # Recreamos el scheduler saltando el warmup (ya con los pesos del optimizador bueno)
-            scheduler = build_scheduler(optimizer, warmup_steps, total_steps, c_step=global_step, skip=True)
+            # Recreamos el scheduler estandar y avanzamos
+            scheduler = build_scheduler(optimizer, warmup_steps, total_steps)
+            
+            import warnings
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                for _ in range(global_step):
+                    scheduler.step()
+                    
             trainer.scheduler = scheduler # Actualizamos la referencia en el trainer
             
             controller.warmup_aborted = True
