@@ -209,11 +209,16 @@ def main():
                 "epoch": epoch, "global_step": global_step,
                 "controller": controller.state_dict()
             }
-            torch.save(ckpt, CONFIG["paths"]["checkpoint_path"])
+            
+            tmp_ckpt_path = CONFIG["paths"]["checkpoint_path"] + ".tmp"
+            torch.save(ckpt, tmp_ckpt_path)
+            os.replace(tmp_ckpt_path, CONFIG["paths"]["checkpoint_path"])
             
             if (epoch + 1) % eval_freq == 0:
                 if curr_acc == controller.best_acc and curr_acc > 0:
-                    torch.save(ckpt, CONFIG["paths"]["best_checkpoint_path"])
+                    tmp_best_path = CONFIG["paths"]["best_checkpoint_path"] + ".tmp"
+                    torch.save(ckpt, tmp_best_path)
+                    os.replace(tmp_best_path, CONFIG["paths"]["best_checkpoint_path"])
                     logger.info("🏆 Best model guardado")
 
             log_buffer.append([

@@ -110,6 +110,15 @@ class MoCoTrainer:
                 self.last_unif = metrics['uniformity']
 
         num_steps = max(1, len(loader))
+        
+        if self.is_distributed:
+            metrics_tensor = torch.tensor([
+                epoch_loss, pos_sum, neg_sum, align_sum, unif_sum, std_sum, grad_norm_sum
+            ], device=self.device, dtype=torch.float32)
+            dist.all_reduce(metrics_tensor, op=dist.ReduceOp.SUM)
+            metrics_tensor /= dist.get_world_size()
+            epoch_loss, pos_sum, neg_sum, align_sum, unif_sum, std_sum, grad_norm_sum = metrics_tensor.tolist()
+
         return {
             'loss': epoch_loss / num_steps,
             'pos': pos_sum / num_steps,

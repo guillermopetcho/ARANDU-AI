@@ -52,15 +52,12 @@ class MoCoDataset(Dataset):
         return len(self.paths)
 
     def __getitem__(self, idx):
-        for _ in range(10): 
+        while True:
             try:
                 img = Image.open(self.paths[idx]).convert("RGB")
                 return self.t_q(img), self.t_k(img)
             except Exception:
                 idx = random.randint(0, len(self.paths) - 1)
-        
-        dummy = Image.new("RGB", (224, 224))
-        return self.t_q(dummy), self.t_k(dummy)
 
 def build_index(root, rank, cache_path):
     if os.path.exists(cache_path):
