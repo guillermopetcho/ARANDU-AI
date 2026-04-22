@@ -20,5 +20,12 @@ def build_scheduler(opt, w_steps, t_steps, c_step=0, skip=False):
 
 @torch.no_grad()
 def momentum_update(model_q, model_k, m):
-    for param_q, param_k in zip(model_q.parameters(), model_k.parameters()):
+    # Desenvuelver DDP y torch.compile para acceder a los parámetros reales
+    # DDP: model_q.module; torch.compile: model_q._orig_mod
+    q = model_q
+    if hasattr(q, 'module'):       # DDP wrapper
+        q = q.module
+    if hasattr(q, '_orig_mod'):    # torch.compile wrapper
+        q = q._orig_mod
+    for param_q, param_k in zip(q.parameters(), model_k.parameters()):
         param_k.data = param_k.data * m + param_q.data * (1. - m)

@@ -19,18 +19,18 @@ class RandomRotate90:
         return T.functional.rotate(img, random.choice(self.angles))
 
 def get_transforms():
+    """Devuelve transformaciones para las 2 vistas globales (224x224)."""
     t_q = T.Compose([
         T.RandomResizedCrop(224, scale=(0.2, 1.0)),
         T.RandomHorizontalFlip(),
         RandomRotate90(),
-        T.RandomSolarize(threshold=128, p=0.2), 
+        T.RandomSolarize(threshold=128, p=0.2),
         T.ColorJitter(0.4, 0.4, 0.4, 0.1),
         T.RandomGrayscale(p=0.2),
         T.GaussianBlur(kernel_size=9, sigma=(0.1, 2.0)),
         T.ToTensor(),
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ])
-
     t_k = T.Compose([
         T.RandomResizedCrop(224, scale=(0.2, 1.0)),
         T.RandomHorizontalFlip(),
@@ -43,10 +43,42 @@ def get_transforms():
     ])
     return t_q, t_k
 
+def get_local_transforms(n_crops=4, scale=(0.05, 0.4), size=96):
+    """
+    Devuelve una lista de N transformaciones para vistas locales (Multi-Crop DINO-style).
+    Las vistas locales son recortes pequeños (96x96 por defecto) de baja escala
+    que fuerzan al modelo a aprender invarianzas finas del dominio (ej. manchas en hojas).
+    """
+    return [
+        T.Compose([
+            T.RandomResizedCrop(size, scale=scale),
+            T.RandomHorizontalFlip(),
+            T.RandomSolarize(threshold=128, p=0.1),
+            T.ColorJitter(0.4, 0.4, 0.2, 0.1),
+            T.RandomGrayscale(p=0.2),
+            T.GaussianBlur(kernel_size=5, sigma=(0.1, 1.5)),
+            T.ToTensor(),
+            T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        ])
+        for _ in range(n_crops)
+    ]
+
 class MoCoDataset(Dataset):
-    def __init__(self, paths):
+    def __init__(self, paths, moco_config=None):
         self.paths = paths
         self.t_q, self.t_k = get_transforms()
+        
+        # Multi-Crop: Configuración de vistas locales
+        if moco_config is not None:
+            n_local = moco_config.get('num_local_crops', 0)
+            scale_min = moco_config.get('local_crop_scale_min', 0.05)
+            scale_max = moco_config.get('local_crop_scale_max', 0.4)
+            size = moco_config.get('local_crop_size', 96)
+        else:
+            n_local = 0
+            scale_min, scale_max, size = 0.05, 0.4, 96
+        
+        self.local_transforms = get_local_transforms(n_local, (scale_min, scale_max), size) if n_local > 0 else []
 
     def __len__(self):
         return len(self.paths)
@@ -55,8 +87,19 @@ class MoCoDataset(Dataset):
         while True:
             try:
                 img = Image.open(self.paths[idx]).convert("RGB")
-                return self.t_q(img), self.t_k(img)
+                v_q = self.t_q(img)
+                v_k = self.t_k(img)
+                
+                if self.local_transforms:
+                    # Apilar N vistas locales: [N_local, C, H, W]
+                    locals_ = torch.stack([t(img) for t in self.local_transforms])
+                    return v_q, v_k, locals_
+                
+                return v_q, v_k
             except Exception:
+                # B12 FIX: Evitar ValueError si el dataset está vacío
+                if len(self.paths) == 0:
+                    raise RuntimeError("MoCoDataset está vacío, no hay imágenes disponibles.")
                 idx = random.randint(0, len(self.paths) - 1)
 
 def build_index(root, rank, cache_path):
@@ -68,11 +111,21 @@ def build_index(root, rank, cache_path):
     return files
 
 class ModelBase(nn.Module):
-    def __init__(self, dim=256):
+    """
+    Backbone ResNet50 + Projector MLP 3-capas + Predictor MLP (MoCo v3).
+    
+    Durante entrenamiento:
+      - Queries: forward(x, use_predictor=True)  → predictor(projector(encoder(x)))
+      - Keys:    forward(x, use_predictor=False) → projector(encoder(x))
+    Durante evaluación/export:
+      - forward(x) → projector(encoder(x))  [use_predictor=False por defecto]
+    """
+    def __init__(self, dim=256, predictor_hidden_dim=4096):
         super().__init__()
         self.encoder = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
         self.encoder.fc = nn.Identity()
         
+        # Projector: 2048 → 2048 → 2048 → dim
         self.projector = nn.Sequential(
             nn.Linear(2048, 2048),
             nn.BatchNorm1d(2048),
@@ -83,12 +136,29 @@ class ModelBase(nn.Module):
             nn.Linear(2048, dim),
             nn.BatchNorm1d(dim, affine=False)
         )
+        
+        # Predictor MLP (MoCo v3): dim → predictor_hidden_dim → dim
+        # Solo se aplica al modelo Query durante el entrenamiento.
+        # Separa la dinámica de aprendizaje del query vs el key, mejorando la estabilidad.
+        self.predictor = nn.Sequential(
+            nn.Linear(dim, predictor_hidden_dim),
+            nn.BatchNorm1d(predictor_hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(predictor_hidden_dim, dim)
+        )
 
-    def forward(self, x):
+    def forward(self, x, use_predictor=False):
         h = self.encoder(x)
         z = self.projector(h)
-        # Force float32 for L2 norm to prevent FP16 overflow (inf), which causes NaNs.
-        return F.normalize(z.float(), dim=1).to(z.dtype)
+        # Normalizar en float32 para evitar overflow de FP16
+        z = F.normalize(z.float(), dim=1).to(z.dtype)
+        
+        if use_predictor:
+            p = self.predictor(z)
+            p = F.normalize(p.float(), dim=1).to(p.dtype)
+            return p
+        
+        return z
 
 class MoCoQueue(nn.Module):
     def __init__(self, dim=256, K=32768):

@@ -21,11 +21,20 @@ def get_faiss_resources():
 
 @torch.no_grad()
 def extract_features_fast(model, loader, device):
-    model.eval()
+    """Extrae features usando el encoder (sin predictor).
+    El modelo debe estar en .eval() antes de llamar a esta función.
+    """
     feats, labels = [], []
     for x, y in loader:
         x = x.to(device, non_blocking=True)
-        z = model(x)
+        # F1 FIX: Llamar siempre con use_predictor=False para asegurar
+        # que se usan las representaciones del projector, no del predictor.
+        # Soporta tanto ModelBase directo como modelos envueltos (DDP/compile).
+        try:
+            z = model(x, use_predictor=False)
+        except TypeError:
+            # Fallback: si el modelo no acepta el kwarg (ej. resnet crudo)
+            z = model(x)
         feats.append(z.cpu())
         labels.append(y)
     return torch.cat(feats).numpy(), torch.cat(labels).numpy()

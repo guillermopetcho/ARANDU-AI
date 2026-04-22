@@ -17,7 +17,15 @@ moco:
   momentum_base: 0.999
   temp_start: 0.15
   temp_end: 0.12
-  temp_warmup_steps: 100 # 🔥 Nuevo: Calentamiento térmico en lugar del hack loss=0
+  temp_warmup_steps: 100
+  # MoCo v3: Predictor MLP (cabeza de predicción para queries solamente)
+  predictor_hidden_dim: 4096
+  # Multi-Crop DINO-style: Vistas locales adicionales de alta granularidad
+  num_local_crops: 4          # 0 para desactivar (backward-compatible)
+  local_crop_scale_min: 0.05  # Escala mínima del recorte local (% del área)
+  local_crop_scale_max: 0.40  # Escala máxima del recorte local
+  local_crop_size: 96         # Resolución de vistas locales en píxeles
+  local_loss_weight: 0.5      # Peso de la pérdida de vistas locales vs. globales
 
 paths:
   dataset_root: "/kaggle/input/datasets/joaquinignaciopetcho/base-soja-encoder-full/BASE-SOJA-ENCODER-FULL"

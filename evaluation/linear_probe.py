@@ -22,9 +22,13 @@ def run_linear_probe(encoder, train_ds, val_ds, num_classes, config, device):
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=25)
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     
-    # 🔥 FIX: Dataloaders optimizados
-    train_loader = DataLoader(train_ds, batch_size=256, shuffle=True, num_workers=config['training']['num_workers'], pin_memory=True, persistent_workers=True)
-    val_loader = DataLoader(val_ds, batch_size=128, shuffle=False, num_workers=config['training']['num_workers'], pin_memory=True)
+    n_workers = config['training']['num_workers']
+    # B11 FIX: persistent_workers solo es válido cuando num_workers > 0
+    train_loader = DataLoader(train_ds, batch_size=256, shuffle=True,
+                              num_workers=n_workers, pin_memory=True,
+                              persistent_workers=(n_workers > 0))
+    val_loader = DataLoader(val_ds, batch_size=128, shuffle=False,
+                            num_workers=n_workers, pin_memory=True)
     
     for epoch in range(25):
         classifier.train()
