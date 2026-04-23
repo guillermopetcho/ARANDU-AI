@@ -6,6 +6,7 @@ import csv
 import yaml
 import json
 import warnings
+import glob
 import torch
 import torch.nn as nn
 import torch.distributed as dist
@@ -28,6 +29,83 @@ from models.moco import build_index, MoCoDataset, ModelBase, MoCoQueue
 
 def get_model_module(model, is_distributed):
     return model.module if is_distributed else model
+
+
+def resolve_kaggle_paths(paths_config, rank=0):
+    """Auto-descubre la ubicación real del dataset en Kaggle.
+    
+    En Kaggle, los datasets se montan en /kaggle/input/ con una estructura que
+    incluye el username del dueño del dataset. Cuando el notebook se forkea,
+    el username puede cambiar. Esta función busca el dataset por su nombre
+    de carpeta (slug) independientemente de la ruta completa del usuario.
+    
+    Estrategia:
+      1. Si el path configurado ya existe, usarlo directamente (zero-cost path).
+      2. Si no existe, extraer el nombre de la carpeta final del path configurado
+         y buscarlo recursivamente bajo /kaggle/input/.
+      3. Si se encuentra, parchear TODOS los paths del config que dependan del
+         dataset root para mantener consistencia.
+    """
+    logger = logging.getLogger("AranduSSL")
+    dataset_root = paths_config.get("dataset_root", "")
+    
+    # Si el path ya existe, no hay nada que resolver
+    if os.path.isdir(dataset_root):
+        return paths_config
+    
+    # Solo aplicar auto-discovery en entorno Kaggle
+    if not os.path.isdir("/kaggle/input"):
+        return paths_config
+    
+    # Extraer el nombre de la carpeta del dataset (última parte del path)
+    # Ejemplo: de "/kaggle/input/datasets/user/base-soja-encoder-full/BASE-SOJA-ENCODER-FULL"
+    #          extraemos "BASE-SOJA-ENCODER-FULL"
+    dataset_folder_name = os.path.basename(dataset_root)
+    if not dataset_folder_name:
+        return paths_config
+    
+    # Buscar la carpeta en /kaggle/input/ (puede estar a cualquier profundidad)
+    found = None
+    for dirpath, dirnames, _ in os.walk("/kaggle/input"):
+        if dataset_folder_name in dirnames:
+            found = os.path.join(dirpath, dataset_folder_name)
+            break
+    
+    if found is None:
+        # Fallback: intentar buscar por el slug del dataset (penúltimo componente)
+        # Ejemplo: "base-soja-encoder-full"
+        path_parts = dataset_root.rstrip("/").split("/")
+        if len(path_parts) >= 2:
+            dataset_slug = path_parts[-2]  # ej. "base-soja-encoder-full"
+            for dirpath, dirnames, _ in os.walk("/kaggle/input"):
+                if dataset_slug in dirnames:
+                    candidate = os.path.join(dirpath, dataset_slug, dataset_folder_name)
+                    if os.path.isdir(candidate):
+                        found = candidate
+                        break
+    
+    if found is None:
+        if rank == 0:
+            logger.warning(f"⚠️ No se encontró '{dataset_folder_name}' bajo /kaggle/input/. "
+                           f"Path original: {dataset_root}")
+        return paths_config
+    
+    # Parchear todos los paths que usen el dataset_root antiguo
+    old_root = dataset_root
+    new_root = found
+    
+    if rank == 0:
+        logger.info(f"🔍 Auto-discovery: dataset encontrado en {new_root}")
+        logger.info(f"   (path original del config: {old_root})")
+    
+    patched = {}
+    for key, value in paths_config.items():
+        if isinstance(value, str) and old_root in value:
+            patched[key] = value.replace(old_root, new_root)
+        else:
+            patched[key] = value
+    
+    return patched
 
 # B1 FIX: Eliminada la función local duplicada. Se usa únicamente la importada de engine/scheduler.
 # La función local sobreescribía la importada sin querer.
@@ -89,6 +167,12 @@ def main():
     
     with open(config_path, "r") as f:
         CONFIG = yaml.safe_load(f)
+
+    # 🔥 FIX: Auto-discovery de paths en Kaggle independiente del usuario.
+    # El dataset slug (ej. "base-soja-encoder-full") y el nombre de la carpeta raíz
+    # (ej. "BASE-SOJA-ENCODER-FULL") son constantes, pero el username en la ruta cambia.
+    # Buscamos recursivamente bajo /kaggle/input/ para resolver el path real.
+    CONFIG["paths"] = resolve_kaggle_paths(CONFIG["paths"], rank)
 
     # Inicializar el Controlador Adaptativo
     controller = TrainingController(CONFIG)
@@ -214,7 +298,7 @@ def main():
         
     if ckpt_to_load:
         if rank == 0: logger.info(f"🔄 Reanudando entrenamiento desde {ckpt_to_load}")
-        ckpt = torch.load(ckpt_to_load, map_location="cpu")
+        ckpt = torch.load(ckpt_to_load, map_location="cpu", weights_only=False)
         
         model_q.load_state_dict(adapt_keys(ckpt["model_q"], is_compiled, is_distributed), strict=False)
         model_k.load_state_dict(adapt_keys(ckpt["model_k"], is_compiled, False), strict=False)
@@ -363,7 +447,7 @@ def main():
                 if rank == 0: logger.warning("⚠️ Rollback solicitado pero no hay checkpoint disponible. Continuando.")
                 stop_signal.fill_(0)
                 continue
-            ckpt = torch.load(rollback_ckpt_path, map_location="cpu")
+            ckpt = torch.load(rollback_ckpt_path, map_location="cpu", weights_only=False)
             model_q.load_state_dict(adapt_keys(ckpt["model_q"], is_compiled, is_distributed), strict=False)
             model_k.load_state_dict(adapt_keys(ckpt["model_k"], is_compiled, False), strict=False)
             optimizer.load_state_dict(ckpt["optimizer"])
@@ -418,7 +502,7 @@ def main():
         if not best_ckpt_file or not os.path.exists(best_ckpt_file):
             logger.warning("⚠️ No se encontró ningún checkpoint para Linear Probe. Saltando.")
         else:
-            best_ckpt = torch.load(best_ckpt_file, map_location=device)
+            best_ckpt = torch.load(best_ckpt_file, map_location=device, weights_only=False)
             clean_enc = {}
             for k, v in best_ckpt["model_q"].items():
                 k_clean = k.replace("_orig_mod.", "")

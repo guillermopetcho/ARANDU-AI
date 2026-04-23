@@ -42,12 +42,11 @@ class MoCoTrainer:
         for step, batch in enumerate(pbar):
             # F6 FIX: local_crops es [B, N, C, H, W] (5D).
             # channels_last solo aplica a tensores 4D — se aplica por slice dentro del loop.
-            if isinstance(batch, (list, tuple)) and len(batch) == 3:
-                v_q, v_k, local_crops = batch
+            v_q, v_k, local_crops = batch
+            if local_crops.shape[1] > 0:
                 local_crops = local_crops.to(self.device, non_blocking=True)  # mover sin format
             else:
-                v_q, v_k = batch[0], batch[1]
-                local_crops = None
+                local_crops = None  # Placeholder vacío → desactivar multi-crop
 
             # --- Hiperparámetros dinámicos del Regulador Adaptativo ---
             if self.controller:
@@ -179,11 +178,12 @@ class MoCoTrainer:
 
         if self.is_distributed:
             metrics_tensor = torch.tensor([
-                epoch_loss, pos_sum, neg_sum, align_sum, unif_sum, std_sum, grad_norm_sum
+                epoch_loss, pos_sum, neg_sum, align_sum, unif_sum, std_sum, grad_norm_sum, float(grad_steps)
             ], device=self.device, dtype=torch.float32)
             dist.all_reduce(metrics_tensor, op=dist.ReduceOp.SUM)
-            metrics_tensor /= dist.get_world_size()
-            epoch_loss, pos_sum, neg_sum, align_sum, unif_sum, std_sum, grad_norm_sum = metrics_tensor.tolist()
+            metrics_tensor[:7] /= dist.get_world_size()  # Promediar métricas, pero sumar grad_steps
+            epoch_loss, pos_sum, neg_sum, align_sum, unif_sum, std_sum, grad_norm_sum, grad_steps = metrics_tensor.tolist()
+            grad_steps = int(grad_steps)
 
         return {
             'loss': epoch_loss / num_steps,

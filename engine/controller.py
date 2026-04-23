@@ -48,7 +48,8 @@ class TrainingController:
         
         warmup_steps = self.config['moco'].get('temp_warmup_steps', 100)
         if step < warmup_steps:
-            temp = 0.5 - (0.5 - self.config['moco']['temp_start']) * (step / warmup_steps)
+            # Warmup lineal: comienza en temp_start y baja suavemente hacia temp_end
+            temp = self.config['moco']['temp_start']
         else:
             progress = min(max((step - warmup_steps) / max(1, total_steps - warmup_steps), 0.0), 1.0)
             temp = self.config['moco']['temp_end'] + (self.config['moco']['temp_start'] - self.config['moco']['temp_end']) * 0.5 * (1 + math.cos(math.pi * progress))

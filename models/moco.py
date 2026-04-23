@@ -93,9 +93,11 @@ class MoCoDataset(Dataset):
                 if self.local_transforms:
                     # Apilar N vistas locales: [N_local, C, H, W]
                     locals_ = torch.stack([t(img) for t in self.local_transforms])
-                    return v_q, v_k, locals_
+                else:
+                    # Placeholder vacío para mantener collation consistente [0, C, H, W]
+                    locals_ = torch.empty(0, *v_q.shape)
                 
-                return v_q, v_k
+                return v_q, v_k, locals_
             except Exception:
                 # B12 FIX: Evitar ValueError si el dataset está vacío
                 if len(self.paths) == 0:
