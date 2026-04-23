@@ -29,3 +29,23 @@ def compute_metrics(q, k):
             
         metrics['std'] = q.std(dim=0).mean().item()
     return metrics
+
+def get_module_stats(module):
+    """Calcula estadísticas agregadas de los parámetros de un módulo (mean, std, norm)."""
+    stats = {}
+    with torch.no_grad():
+        all_params = []
+        for name, param in module.named_parameters():
+            p_data = param.data.float()
+            all_params.append(p_data.view(-1))
+            # Estadísticas por capa individual (simplificado)
+            if p_data.numel() > 1:
+                stats[f"{name}_std"] = p_data.std().item()
+            stats[f"{name}_mean"] = p_data.mean().item()
+        
+        if all_params:
+            total_p = torch.cat(all_params)
+            stats['total_mean'] = total_p.mean().item()
+            stats['total_std'] = total_p.std().item()
+            stats['total_norm'] = total_p.norm(2).item()
+    return stats

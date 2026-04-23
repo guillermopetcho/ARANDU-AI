@@ -25,6 +25,7 @@ from engine.controller import TrainingController, Action
 from evaluation.knn import extract_features_fast, fast_knn
 from evaluation.linear_probe import run_linear_probe
 from models.moco import build_index, MoCoDataset, ModelBase, MoCoQueue
+from utils.metrics import get_module_stats
 
 
 def get_model_module(model, is_distributed):
@@ -337,10 +338,18 @@ def main():
         queue.load_state_dict(ckpt["queue"])
         start_epoch = ckpt["epoch"] + 1
     log_file = CONFIG["paths"]["metrics_path"].replace('.json', '_log.csv')
+    proj_log_file = CONFIG["paths"]["metrics_path"].replace('.json', '_projector.csv')
 
-    if rank == 0 and not os.path.exists(log_file):
-        with open(log_file, "w", newline="") as f:
-            csv.writer(f).writerow(["epoch","loss","lr","knn_acc","pos","neg","margin","align","unif","std","gn","tput","data_err"])
+    if rank == 0:
+        if not os.path.exists(log_file):
+            with open(log_file, "w", newline="") as f:
+                csv.writer(f).writerow(["epoch","loss","lr","knn_acc","pos","neg","margin","align","unif","std","gn","tput","data_err"])
+        
+        # Inicializar log de projector si no existe
+        if not os.path.exists(proj_log_file):
+            with open(proj_log_file, "w", newline="") as f:
+                # Columnas base, el resto se autogeneran en el primer log
+                csv.writer(f).writerow(["epoch", "total_mean", "total_std", "total_norm"])
 
     for epoch in range(start_epoch, CONFIG["training"]["epochs"]):
         # B4 FIX: Guard explícito para evitar AttributeError cuando sampler es None
@@ -405,6 +414,19 @@ def main():
             if (epoch + 1) % eval_freq == 0:
                 with open(log_file, "a", newline="") as f: csv.writer(f).writerows(log_buffer)
                 log_buffer.clear()
+                
+                # S1 FIX: Guardar estadísticas de parámetros del Projector
+                model_to_save = get_model_module(model_q, is_distributed)
+                if hasattr(model_to_save, 'projector'):
+                    p_stats = get_module_stats(model_to_save.projector)
+                    p_stats['epoch'] = epoch + 1
+                    
+                    file_exists = os.path.isfile(proj_log_file)
+                    with open(proj_log_file, "a", newline="") as f:
+                        writer = csv.DictWriter(f, fieldnames=sorted(p_stats.keys()))
+                        if f.tell() == 0: # Caso borde si el archivo se vació
+                            writer.writeheader()
+                        writer.writerow(p_stats)
                 
             logger.info(f"Ep {epoch+1} | Loss {metrics['loss']:.3f} | U: {metrics['unif']:.2f} | LR: {optimizer.param_groups[0]['lr']:.4f} (x{controller.lr_multiplier:.2f}) | Err: {metrics.get('data_err', 0):.2f}%")
             
