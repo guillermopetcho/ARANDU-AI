@@ -3,6 +3,16 @@ import torch
 import math
 
 def build_scheduler(opt, w_steps, t_steps, c_step=0, skip=False):
+    """Construye un scheduler LambdaLR con warmup lineal + decaimiento cosenoidal.
+    
+    Args:
+        opt: Optimizer de PyTorch.
+        w_steps: Pasos de warmup (rampa lineal de 1% a 100% del LR base).
+        t_steps: Pasos totales de entrenamiento.
+        c_step: Paso actual (usado solo con skip=True para ajustar el decaimiento).
+        skip: Si True, omite el warmup y arranca directo en decaimiento cosenoidal
+              desde el paso c_step. Útil para reanudación post-rollback.
+    """
     if skip:
         def lr_lambda(step):
             progress = step / max(1, t_steps - c_step)

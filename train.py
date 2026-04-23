@@ -274,7 +274,8 @@ def main():
     queue = MoCoQueue(dim=CONFIG["moco"]["dim"], K=CONFIG["moco"]["queue"]).to(device)
 
     optimizer = torch.optim.SGD(model_q.parameters(), lr=lr, momentum=0.9, weight_decay=float(CONFIG["training"]["weight_decay"]))
-    scaler = GradScaler(enabled=CONFIG["training"]["use_amp"])
+    # M5 FIX: Pasar device_type explícitamente para evitar deprecation warning en PyTorch 2.x+
+    scaler = GradScaler(device.type, enabled=CONFIG["training"]["use_amp"])
     
     total_steps = CONFIG["training"]["epochs"] * math.ceil(len(train_loader) / CONFIG["training"]["grad_accum_steps"])
     warmup_steps = max(1, CONFIG["training"]["warmup_epochs"] * math.ceil(len(train_loader) / CONFIG["training"]["grad_accum_steps"]))
@@ -427,7 +428,10 @@ def main():
                 except Exception:
                     pass
 
+        # R4 FIX: Barrera DDP antes del broadcast para que los ranks ≥1
+        # no hagan timeout mientras rank 0 ejecuta evaluación KNN.
         if is_distributed:
+            dist.barrier()
             dist.broadcast(stop_signal, src=0)
         
         if stop_signal.item() == 2:
@@ -503,15 +507,16 @@ def main():
             logger.warning("⚠️ No se encontró ningún checkpoint para Linear Probe. Saltando.")
         else:
             best_ckpt = torch.load(best_ckpt_file, map_location=device, weights_only=False)
+            # L6 FIX: clean_state_dict_for_save ya elimina _orig_mod y module prefixes.
+            # Solo necesitamos extraer las claves del encoder (descartar projector/predictor).
             clean_enc = {}
             for k, v in best_ckpt["model_q"].items():
-                k_clean = k.replace("_orig_mod.", "")
-                if k_clean.startswith("module.encoder."):
-                    clean_enc[k_clean.replace("module.encoder.", "")] = v
-                elif k_clean.startswith("encoder."):
+                k_clean = k.replace("_orig_mod.", "").replace("module.", "")
+                if k_clean.startswith("encoder."):
                     clean_enc[k_clean.replace("encoder.", "")] = v
 
-            eval_enc = models.resnet50(weights=None); eval_enc.fc = nn.Identity()
+            eval_enc = models.resnet50(weights=None)
+            eval_enc.fc = nn.Identity()
             eval_enc.load_state_dict(clean_enc, strict=False)
 
             num_classes = len(eval_ds.classes)

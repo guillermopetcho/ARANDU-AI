@@ -1,7 +1,9 @@
 import math
 import logging
+from enum import IntEnum
 
-class Action:
+# M2 FIX: IntEnum para type-safety manteniendo compatibilidad con comparaciones int
+class Action(IntEnum):
     CONTINUE = 0
     EARLY_STOP = 1
     ROLLBACK = 2
@@ -135,12 +137,19 @@ class TrainingController:
                 if self.patience >= self.config["training"]["early_stopping_patience"]:
                     self.logger.warning("⛔ Early Stopping activado por el Controlador.")
                     return Action.EARLY_STOP
-                    
-            if is_warmup and self.best_acc > 0:
-                threshold = max(0.02, 0.05 * (1 - self.best_acc))
+            
+            # Detección de caída catastrófica con rollback
+            if self.best_acc > 0:
+                if is_warmup:
+                    # Warmup: umbral más sensible
+                    threshold = max(0.02, 0.05 * (1 - self.best_acc))
+                else:
+                    # L3 FIX: Post-warmup: rollback de emergencia ante caídas severas (>20% del best)
+                    threshold = max(0.05, 0.20 * self.best_acc)
+                
                 if curr_acc < (self.best_acc - threshold):
                     if (epoch - self.last_rollback_epoch) > self.rollback_cooldown:
-                        self.logger.warning(f"⚠️ Caída catastrófica (KNN {curr_acc:.4f} < {self.best_acc:.4f}). ROLLBACK.")
+                        self.logger.warning(f"⚠️ Caída catastrófica (KNN {curr_acc:.4f} < {self.best_acc:.4f}, threshold={threshold:.4f}). ROLLBACK.")
                         self.last_rollback_epoch = epoch
                         # Reset reguladores en rollback
                         self.lr_multiplier = 0.5 

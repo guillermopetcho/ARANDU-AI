@@ -1,0 +1,12 @@
+# ARANDU ENCODER — Dependencias
+torch>=2.0.0
+torchvision>=0.15.0
+numpy>=1.24.0
+scikit-learn>=1.2.0
+tqdm>=4.65.0
+pyyaml>=6.0
+Pillow>=9.5.0
+
+# Opcionales (mejoran rendimiento pero no son requeridas)
+# wandb              # Logging con Weights & Biases
+# faiss-gpu          # KNN acelerado por GPU (fallback: sklearn)

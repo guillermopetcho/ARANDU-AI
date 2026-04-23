@@ -32,6 +32,8 @@ class MoCoTrainer:
         self.model_q.train()
         epoch_loss, pos_sum, neg_sum, align_sum, unif_sum, std_sum = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
         grad_norm_sum, grad_steps = 0.0, 0
+        # L1 FIX: Contador de batches válidos para no diluir métricas cuando hay NaN skips
+        valid_steps = 0
         # T1 FIX: Inicializar aliases antes del loop para evitar UnboundLocalError
         # si el primer batch produce NaN y el loop hace 'continue' sin asignarlos.
         q = k = l_pos = l_neg = None
@@ -165,6 +167,7 @@ class MoCoTrainer:
             # === Métricas === (solo si q y k fueron asignados en este step)
             if q is not None:
                 epoch_loss += loss.item()
+                valid_steps += 1  # L1 FIX: Solo contar batches procesados exitosamente
                 with torch.no_grad():
                     metrics_step = compute_metrics(q, k)
                     pos_sum += l_pos.mean().item()
@@ -174,16 +177,23 @@ class MoCoTrainer:
                     std_sum += metrics_step['std']
                     self.last_unif = metrics_step['uniformity']
 
-        num_steps = max(1, len(loader))
+        # L1 FIX: Usar valid_steps (batches realmente procesados) en vez de len(loader)
+        # para que los batches NaN saltados no diluyan las métricas reportadas.
+        num_steps = max(1, valid_steps)
 
         if self.is_distributed:
             metrics_tensor = torch.tensor([
-                epoch_loss, pos_sum, neg_sum, align_sum, unif_sum, std_sum, grad_norm_sum, float(grad_steps)
+                epoch_loss, pos_sum, neg_sum, align_sum, unif_sum, std_sum,
+                grad_norm_sum, float(grad_steps), float(valid_steps)
             ], device=self.device, dtype=torch.float32)
             dist.all_reduce(metrics_tensor, op=dist.ReduceOp.SUM)
-            metrics_tensor[:7] /= dist.get_world_size()  # Promediar métricas, pero sumar grad_steps
-            epoch_loss, pos_sum, neg_sum, align_sum, unif_sum, std_sum, grad_norm_sum, grad_steps = metrics_tensor.tolist()
+            # L2 FIX: Promediar solo las métricas de entrenamiento (indices 0-5).
+            # grad_norm_sum y grad_steps se suman para calcular el ratio correctamente.
+            metrics_tensor[:6] /= dist.get_world_size()
+            epoch_loss, pos_sum, neg_sum, align_sum, unif_sum, std_sum, \
+                grad_norm_sum, grad_steps, valid_steps = metrics_tensor.tolist()
             grad_steps = int(grad_steps)
+            num_steps = max(1, int(valid_steps / dist.get_world_size()))  # Promedio de valid_steps
 
         return {
             'loss': epoch_loss / num_steps,

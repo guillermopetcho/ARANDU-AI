@@ -2,6 +2,7 @@ import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
 from torchvision import models, transforms as T
 from torch.utils.data import Dataset
 from PIL import Image
@@ -84,7 +85,9 @@ class MoCoDataset(Dataset):
         return len(self.paths)
 
     def __getitem__(self, idx):
-        while True:
+        # M4 FIX: Límite de reintentos para evitar loop infinito si muchas imágenes son corruptas
+        max_retries = min(100, len(self.paths))
+        for attempt in range(max_retries):
             try:
                 img = Image.open(self.paths[idx]).convert("RGB")
                 v_q = self.t_q(img)
@@ -103,13 +106,30 @@ class MoCoDataset(Dataset):
                 if len(self.paths) == 0:
                     raise RuntimeError("MoCoDataset está vacío, no hay imágenes disponibles.")
                 idx = random.randint(0, len(self.paths) - 1)
+        raise RuntimeError(f"MoCoDataset: {max_retries} imágenes consecutivas fallaron al cargarse. Verificar integridad del dataset.")
 
 def build_index(root, rank, cache_path):
+    """Construye o carga el índice de imágenes del dataset.
+    
+    C2 FIX: En DDP, rank 0 escribe el cache y luego se sincroniza con
+    dist.barrier() para que los demás ranks lean el cache completo.
+    """
+    is_dist = dist.is_available() and dist.is_initialized()
+    
     if os.path.exists(cache_path):
-        return np.load(cache_path).tolist()
+        return np.load(cache_path, allow_pickle=True).tolist()
+    
     files = sorted([str(f) for ext in ["*.jpg", "*.png", "*.jpeg"] for f in Path(root).rglob(ext)])
-    if len(files) == 0: raise RuntimeError(f"No imágenes en {root}")
-    if rank == 0: np.save(cache_path, files)
+    if len(files) == 0:
+        raise RuntimeError(f"No imágenes en {root}")
+    
+    if rank == 0:
+        np.save(cache_path, files)
+    
+    # C2 FIX: Barrera para que ranks ≥1 esperen a que rank 0 termine de escribir el cache
+    if is_dist:
+        dist.barrier()
+    
     return files
 
 class ModelBase(nn.Module):
