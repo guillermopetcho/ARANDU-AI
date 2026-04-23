@@ -31,8 +31,7 @@ class MoCoTrainer:
     def train_epoch(self, loader, epoch, global_step, total_steps, rank):
         self.model_q.train()
         epoch_loss, pos_sum, neg_sum, align_sum, unif_sum, std_sum = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
-        grad_norm_sum, grad_steps = 0.0, 0
-        # L1 FIX: Contador de batches válidos para no diluir métricas cuando hay NaN skips
+        pos_sim_sum, neg_sim_sum, grad_norm_sum, grad_steps = 0.0, 0.0, 0.0, 0
         valid_steps = 0
         # T1 FIX: Inicializar aliases antes del loop para evitar UnboundLocalError
         # si el primer batch produce NaN y el loop hace 'continue' sin asignarlos.
@@ -181,6 +180,8 @@ class MoCoTrainer:
                     neg_sum += l_neg.mean().item()
                     align_sum += metrics_step['alignment']
                     unif_sum += metrics_step['uniformity']
+                    pos_sim_sum += metrics_step['pos_sim']
+                    neg_sim_sum += metrics_step['neg_sim']
                     std_sum += metrics_step['std']
                     self.last_unif = metrics_step['uniformity']
 
@@ -191,14 +192,12 @@ class MoCoTrainer:
         if self.is_distributed:
             metrics_tensor = torch.tensor([
                 epoch_loss, pos_sum, neg_sum, align_sum, unif_sum, std_sum,
-                grad_norm_sum, float(grad_steps), float(valid_steps)
+                pos_sim_sum, neg_sim_sum, grad_norm_sum, float(grad_steps), float(valid_steps)
             ], device=self.device, dtype=torch.float32)
             dist.all_reduce(metrics_tensor, op=dist.ReduceOp.SUM)
-            # L2 FIX: Promediar solo las métricas de entrenamiento (indices 0-5).
-            # grad_norm_sum y grad_steps se suman para calcular el ratio correctamente.
-            metrics_tensor[:6] /= dist.get_world_size()
+            metrics_tensor[:9] /= dist.get_world_size()
             epoch_loss, pos_sum, neg_sum, align_sum, unif_sum, std_sum, \
-                grad_norm_sum, grad_steps, valid_steps = metrics_tensor.tolist()
+                pos_sim_sum, neg_sim_sum, grad_norm_sum, grad_steps, valid_steps = metrics_tensor.tolist()
             grad_steps = int(grad_steps)
             num_steps = max(1, int(valid_steps / dist.get_world_size()))  # Promedio de valid_steps
 
@@ -220,6 +219,8 @@ class MoCoTrainer:
             'margin': (pos_sum - neg_sum) / num_steps,
             'align': align_sum / num_steps,
             'unif': unif_sum / num_steps,
+            'pos_sim': pos_sim_sum / num_steps,
+            'neg_sim': neg_sim_sum / num_steps,
             'std': std_sum / num_steps,
             'gn': grad_norm_sum / max(1, grad_steps),
             'tput': (len(loader) * self.config['training']['batch_size'] * (dist.get_world_size() if dist.is_initialized() else 1)) / max(1, time.time() - epoch_start),

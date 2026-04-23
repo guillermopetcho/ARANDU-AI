@@ -9,14 +9,14 @@ training:
   weight_decay: 0.0001
   use_amp: True
   save_every: 10
-  early_stopping_patience: 15
+  early_stopping_patience: 50
 
 moco:
   dim: 256
   queue: 16384
   momentum_base: 0.999
-  temp_start: 0.15
-  temp_end: 0.12
+  temp_start: 0.14
+  temp_end: 0.11
   temp_warmup_steps: 100
   # MoCo v3: Predictor MLP (cabeza de predicción para queries solamente)
   predictor_hidden_dim: 4096

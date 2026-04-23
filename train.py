@@ -267,7 +267,7 @@ def main():
     is_compiled = False
     if hasattr(torch, "compile"):
         try:
-            model_q = torch.compile(model_q)
+            model_q = torch.compile(model_q, dynamic=True)
             is_compiled = True
         except Exception as e:
             if rank == 0: logger.warning(f"No se pudo compilar el modelo: {e}")
@@ -351,7 +351,7 @@ def main():
     if rank == 0:
         if not os.path.exists(log_file):
             with open(log_file, "w", newline="") as f:
-                csv.writer(f).writerow(["epoch","loss","lr","knn_acc","pos","neg","margin","align","unif","std","gn","tput","data_err"])
+                csv.writer(f).writerow(["epoch","loss","lr","knn_acc","pos","neg","margin","align","unif","psim","nsim","rnorm","std","gn","tput","data_err"])
         
         # Inicializar log de projector si no existe
         if not os.path.exists(proj_log_file):
@@ -415,7 +415,9 @@ def main():
             log_buffer.append([
                 epoch+1, metrics['loss'], optimizer.param_groups[0]['lr'], curr_acc,
                 metrics['pos'], metrics['neg'], metrics['margin'], metrics['align'], 
-                metrics['unif'], metrics['std'], metrics['gn'], metrics['tput'],
+                metrics['unif'], metrics['pos_sim'], metrics['neg_sim'], 
+                controller.history['ratio_norm'][-1] if controller.history['ratio_norm'] else 1.0,
+                metrics['std'], metrics['gn'], metrics['tput'],
                 metrics.get('data_err', 0)
             ])
             
@@ -446,9 +448,12 @@ def main():
                         "train/lr": optimizer.param_groups[0]['lr'],
                         "train/lr_multiplier": controller.lr_multiplier,
                         "train/momentum_boost": controller.momentum_boost,
-                        "train/temp_boost": controller.temp_boost,
+                        "train/temp_adj": controller.temp_adj,
                         "train/unif": metrics['unif'],
                         "train/align": metrics['align'],
+                        "train/pos_sim": metrics['pos_sim'],
+                        "train/neg_sim": metrics['neg_sim'],
+                        "train/ratio_norm": controller.history['ratio_norm'][-1] if controller.history['ratio_norm'] else 1.0,
                         "train/grad_norm": metrics['gn'],
                         "train/pos_loss": metrics['pos'],
                         "train/neg_loss": metrics['neg'],

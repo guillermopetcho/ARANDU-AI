@@ -13,32 +13,33 @@ import logging
 
 from utils.distributed import concat_all_gather
 
-class RandomRotate90:
-    def __init__(self):
-        self.angles = [0, 90, 180, 270]
-    def __call__(self, img):
-        return T.functional.rotate(img, random.choice(self.angles))
+# Eliminado RandomRotate90 para evitar transformaciones físicamente imposibles en cultivos.
 
 def get_transforms():
-    """Devuelve transformaciones para las 2 vistas globales (224x224)."""
+    """Devuelve transformaciones asimétricas para las 2 vistas globales (224x224).
+    La asimetría (MoCo v3 / BYOL style) ayuda a evitar el colapso y mejora el aprendizaje.
+    """
+    # Vista 1: Más fuerte en color, con Blur moderado, sin Solarize.
     t_q = T.Compose([
         T.RandomResizedCrop(224, scale=(0.2, 1.0)),
         T.RandomHorizontalFlip(),
-        RandomRotate90(),
-        T.RandomSolarize(threshold=128, p=0.2),
+        T.RandomRotation(degrees=15), # Simula viento/ángulo cámara real
         T.ColorJitter(0.4, 0.4, 0.4, 0.1),
         T.RandomGrayscale(p=0.2),
         T.GaussianBlur(kernel_size=9, sigma=(0.1, 2.0)),
         T.ToTensor(),
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ])
+    
+    # Vista 2: Con Solarize probabilístico y Blur más fuerte.
     t_k = T.Compose([
         T.RandomResizedCrop(224, scale=(0.2, 1.0)),
         T.RandomHorizontalFlip(),
-        RandomRotate90(),
+        T.RandomRotation(degrees=15),
         T.ColorJitter(0.4, 0.4, 0.4, 0.1),
         T.RandomGrayscale(p=0.2),
-        T.GaussianBlur(kernel_size=9, sigma=(0.1, 2.0)),
+        T.RandomSolarize(threshold=128, p=0.2), # Asimetría: Solarize solo aquí
+        T.GaussianBlur(kernel_size=9, sigma=(0.5, 2.0)), # Blur base más alto
         T.ToTensor(),
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ])
