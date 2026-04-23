@@ -1,4 +1,5 @@
 import os
+import datetime
 import math
 import copy
 import logging
@@ -156,8 +157,15 @@ def main():
     is_distributed = world_size > 1
     
     if is_distributed:
-        dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
         torch.cuda.set_device(local_rank)
+        # T6 FIX: Aumentar timeout a 2 horas (7200s) para permitir escaneo de datasets grandes
+        # sin que los ranks secundarios expiren en la barrera de build_index.
+        dist.init_process_group(
+            backend="nccl", 
+            rank=rank, 
+            world_size=world_size,
+            timeout=datetime.timedelta(seconds=7200)
+        )
         device = torch.device(f"cuda:{local_rank}")
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
