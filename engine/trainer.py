@@ -95,21 +95,27 @@ class MoCoTrainer:
                     labels = torch.zeros(logits1.shape[0], dtype=torch.long, device=self.device)
                     loss_global = (F.cross_entropy(logits1, labels) + F.cross_entropy(logits2, labels)) * 0.5
 
-                    # === Vistas Locales (Multi-Crop DINO-style) ===
-                    # B7 FIX: Usar float 0.0 en vez de tensor sin grad para el acumulador.
-                    # loss_local se convierte en tensor válido en el primer += desde F.cross_entropy.
+                    # === Vistas Locales (Multi-Crop DINO-style) Vectorizadas ===
+                    # T5 FIX: Vectorización completa para maximizar Throughput.
+                    # Pasamos de O(N) llamadas secuenciales a O(1) llamada masiva.
                     loss_local = 0.0
                     if local_crops is not None:
-                        n_local = local_crops.shape[1]
-                        for i in range(n_local):
-                            # F6 FIX: aplicar channels_last al slice 4D [B,C,H,W]
-                            v_local = local_crops[:, i].contiguous().to(
-                                memory_format=torch.channels_last)
-                            q_local = self.model_q(v_local, use_predictor=True)
-                            l_pos_l = torch.einsum('nc,nc->n', [q_local, k1]).unsqueeze(-1)
-                            l_neg_l = torch.einsum('nc,ck->nk', [q_local, self.queue.queue.detach()])
-                            logits_l = torch.cat([l_pos_l, l_neg_l], dim=1) / temp
-                            loss_local = loss_local + F.cross_entropy(logits_l, labels) / n_local
+                        B, N, C, H, W = local_crops.shape
+                        # [B, N, C, H, W] -> [B*N, C, H, W]
+                        v_local = local_crops.view(-1, C, H, W).contiguous().to(
+                            memory_format=torch.channels_last)
+                        
+                        q_local = self.model_q(v_local, use_predictor=True)
+                        
+                        # Expandir k1 y labels para alinearse con el batch extendido [B*N]
+                        k1_exp = k1.repeat_interleave(N, dim=0)
+                        labels_local = labels.repeat_interleave(N, dim=0)
+                        
+                        l_pos_l = torch.einsum('nc,nc->n', [q_local, k1_exp]).unsqueeze(-1)
+                        l_neg_l = torch.einsum('nc,ck->nk', [q_local, self.queue.queue.detach()])
+                        logits_l = torch.cat([l_pos_l, l_neg_l], dim=1) / temp
+                        
+                        loss_local = F.cross_entropy(logits_l, labels_local)
 
                     loss = loss_global + self.local_loss_weight * loss_local
 
@@ -150,13 +156,14 @@ class MoCoTrainer:
 
                 self.scheduler.step()
 
-                # 🔥 Fix: Aplicar multiplicador dinámico de LR DESPUÉS del scheduler
+                # 🔥 Fix Pro: Aplicar multiplicador dinámico de LR
+                # El scheduler calcula el LR base del paso, y el controlador lo escala.
                 if self.controller:
-                    lr_mult = getattr(self.controller, 'lr_multiplier', 1.0)
-                    if lr_mult != 1.0:
-                        for param_group in self.optimizer.param_groups:
-                            param_group['lr'] *= lr_mult
-
+                    mult = self.controller.lr_multiplier
+                    for param_group in self.optimizer.param_groups:
+                        # Escalamos el valor calculado por el scheduler
+                        param_group['lr'] *= mult
+                
                 self.optimizer.zero_grad(set_to_none=True)
                 global_step += 1
 
@@ -195,6 +202,17 @@ class MoCoTrainer:
             grad_steps = int(grad_steps)
             num_steps = max(1, int(valid_steps / dist.get_world_size()))  # Promedio de valid_steps
 
+        # I1 FIX: Monitorear integridad del dataset
+        load_errors = 0
+        if hasattr(loader.dataset, 'load_errors'):
+            load_errors = loader.dataset.load_errors
+            # Reset para la siguiente época
+            loader.dataset.load_errors = 0
+        
+        error_rate = (load_errors / max(1, len(loader) * self.config['training']['batch_size'])) * 100
+        if error_rate > 1.0 and rank == 0:
+            logging.getLogger("AranduSSL").warning(f"⚠️ Alta tasa de errores de carga: {error_rate:.2f}% ({load_errors} imágenes).")
+
         return {
             'loss': epoch_loss / num_steps,
             'pos': pos_sum / num_steps,
@@ -204,5 +222,6 @@ class MoCoTrainer:
             'unif': unif_sum / num_steps,
             'std': std_sum / num_steps,
             'gn': grad_norm_sum / max(1, grad_steps),
-            'tput': (len(loader) * self.config['training']['batch_size'] * (dist.get_world_size() if dist.is_initialized() else 1)) / max(1, time.time() - epoch_start)
+            'tput': (len(loader) * self.config['training']['batch_size'] * (dist.get_world_size() if dist.is_initialized() else 1)) / max(1, time.time() - epoch_start),
+            'data_err': error_rate
         }, global_step

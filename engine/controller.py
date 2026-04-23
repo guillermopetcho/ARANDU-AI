@@ -145,7 +145,7 @@ class TrainingController:
                     threshold = max(0.02, 0.05 * (1 - self.best_acc))
                 else:
                     # L3 FIX: Post-warmup: rollback de emergencia ante caídas severas (>20% del best)
-                    threshold = max(0.05, 0.20 * self.best_acc)
+                    threshold = max(0.05, 0.10 * self.best_acc)
                 
                 if curr_acc < (self.best_acc - threshold):
                     if (epoch - self.last_rollback_epoch) > self.rollback_cooldown:

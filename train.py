@@ -340,7 +340,7 @@ def main():
 
     if rank == 0 and not os.path.exists(log_file):
         with open(log_file, "w", newline="") as f:
-            csv.writer(f).writerow(["epoch","loss","lr","knn_acc","pos","neg","margin","align","unif","std","gn","tput"])
+            csv.writer(f).writerow(["epoch","loss","lr","knn_acc","pos","neg","margin","align","unif","std","gn","tput","data_err"])
 
     for epoch in range(start_epoch, CONFIG["training"]["epochs"]):
         # B4 FIX: Guard explícito para evitar AttributeError cuando sampler es None
@@ -398,14 +398,15 @@ def main():
             log_buffer.append([
                 epoch+1, metrics['loss'], optimizer.param_groups[0]['lr'], curr_acc,
                 metrics['pos'], metrics['neg'], metrics['margin'], metrics['align'], 
-                metrics['unif'], metrics['std'], metrics['gn'], metrics['tput']
+                metrics['unif'], metrics['std'], metrics['gn'], metrics['tput'],
+                metrics.get('data_err', 0)
             ])
             
             if (epoch + 1) % eval_freq == 0:
                 with open(log_file, "a", newline="") as f: csv.writer(f).writerows(log_buffer)
                 log_buffer.clear()
                 
-            logger.info(f"Ep {epoch+1} | Loss {metrics['loss']:.3f} | U: {metrics['unif']:.2f} | LR: {optimizer.param_groups[0]['lr']:.4f} | LR_Mult: {controller.lr_multiplier:.2f} | TempB: {controller.temp_boost:.2f}")
+            logger.info(f"Ep {epoch+1} | Loss {metrics['loss']:.3f} | U: {metrics['unif']:.2f} | LR: {optimizer.param_groups[0]['lr']:.4f} (x{controller.lr_multiplier:.2f}) | Err: {metrics.get('data_err', 0):.2f}%")
             
             if use_wandb:
                 try:
@@ -422,6 +423,7 @@ def main():
                         "train/pos_loss": metrics['pos'],
                         "train/neg_loss": metrics['neg'],
                         "train/tput": metrics['tput'],
+                        "train/data_error_rate": metrics.get('data_err', 0),
                         "eval/knn_acc": curr_acc if curr_acc >= 0 else None,
                         "epoch": epoch + 1
                     }, step=global_step)

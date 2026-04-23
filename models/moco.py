@@ -80,6 +80,8 @@ class MoCoDataset(Dataset):
             scale_min, scale_max, size = 0.05, 0.4, 96
         
         self.local_transforms = get_local_transforms(n_local, (scale_min, scale_max), size) if n_local > 0 else []
+        self.load_errors = 0
+        self.logger = logging.getLogger("AranduSSL")
 
     def __len__(self):
         return len(self.paths)
@@ -101,36 +103,41 @@ class MoCoDataset(Dataset):
                     locals_ = torch.empty(0, *v_q.shape)
                 
                 return v_q, v_k, locals_
-            except Exception:
-                # B12 FIX: Evitar ValueError si el dataset está vacío
+            except Exception as e:
+                # B12 FIX: Contabilizar errores de carga para monitoreo
+                self.load_errors += 1
                 if len(self.paths) == 0:
                     raise RuntimeError("MoCoDataset está vacío, no hay imágenes disponibles.")
                 idx = random.randint(0, len(self.paths) - 1)
-        raise RuntimeError(f"MoCoDataset: {max_retries} imágenes consecutivas fallaron al cargarse. Verificar integridad del dataset.")
+        raise RuntimeError(f"MoCoDataset: {max_retries} imágenes consecutivas fallaron al cargarse. Último error: {e}")
 
 def build_index(root, rank, cache_path):
-    """Construye o carga el índice de imágenes del dataset.
+    """Construye o carga el índice de imágenes del dataset con sincronización DDP.
     
-    C2 FIX: En DDP, rank 0 escribe el cache y luego se sincroniza con
-    dist.barrier() para que los demás ranks lean el cache completo.
+    C2 FIX: Solo el Rank 0 decide si hay que reconstruir el índice.
+    Se usa una barrera para asegurar que los Ranks >= 1 no intenten leer
+    un archivo parcial mientras Rank 0 escribe.
     """
     is_dist = dist.is_available() and dist.is_initialized()
     
-    if os.path.exists(cache_path):
-        return np.load(cache_path, allow_pickle=True).tolist()
-    
-    files = sorted([str(f) for ext in ["*.jpg", "*.png", "*.jpeg"] for f in Path(root).rglob(ext)])
-    if len(files) == 0:
-        raise RuntimeError(f"No imágenes en {root}")
-    
+    # 1. Rank 0 verifica y construye si es necesario
     if rank == 0:
-        np.save(cache_path, files)
+        if not os.path.exists(cache_path):
+            files = sorted([str(f) for ext in ["*.jpg", "*.png", "*.jpeg"] for f in Path(root).rglob(ext)])
+            if len(files) == 0:
+                raise RuntimeError(f"No se encontraron imágenes en {root}")
+            np.save(cache_path, files)
+            logging.getLogger("AranduSSL").info(f"📁 Índice creado con {len(files)} imágenes.")
     
-    # C2 FIX: Barrera para que ranks ≥1 esperen a que rank 0 termine de escribir el cache
+    # 2. Barrera crítica: todos esperan a que Rank 0 termine de escribir en disco
     if is_dist:
         dist.barrier()
     
-    return files
+    # 3. Todos cargan el mismo archivo (ahora garantizado que existe y está completo)
+    if not os.path.exists(cache_path):
+        raise RuntimeError(f"Fallo crítico: El cache {cache_path} no existe tras la barrera DDP.")
+        
+    return np.load(cache_path, allow_pickle=True).tolist()
 
 class ModelBase(nn.Module):
     """
