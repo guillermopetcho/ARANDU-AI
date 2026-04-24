@@ -296,6 +296,8 @@ def main():
     start_epoch, global_step = 0, 0
     log_buffer = []
     stop_signal = torch.tensor(0, device=device)
+    # Lista para sincronización de objetos DDP (Action, temp_adj, etc.)
+    sync_data = [None] 
     
     ckpt_path = CONFIG["paths"].get("checkpoint_path", "")
     best_ckpt_path = CONFIG["paths"].get("best_checkpoint_path", "")
@@ -465,11 +467,20 @@ def main():
                 except Exception:
                     pass
 
-        # R4 FIX: Barrera DDP antes del broadcast para que los ranks ≥1
-        # no hagan timeout mientras rank 0 ejecuta evaluación KNN.
+        # R4 FIX: Sincronización total del estado del controlador vía DDP.
+        # Rank 0 difunde la acción y el ajuste de temperatura a los demás.
         if is_distributed:
+            if rank == 0:
+                sync_data[0] = {
+                    'action': stop_signal.item(),
+                    'temp_adj': controller.temp_adj
+                }
             dist.barrier()
-            dist.broadcast(stop_signal, src=0)
+            dist.broadcast_object_list(sync_data, src=0)
+            
+            if rank != 0:
+                stop_signal.fill_(sync_data[0]['action'])
+                controller.temp_adj = sync_data[0]['temp_adj']
         
         if stop_signal.item() == 2:
             if rank == 0: logger.info("🔄 Iniciando proceso de Rollback...")
