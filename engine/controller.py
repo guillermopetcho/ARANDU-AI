@@ -50,6 +50,10 @@ class TrainingController:
         }
 
     def get_dynamic_hyperparams(self, step, total_steps, metrics=None):
+        if self.config.get("training", {}).get("exploitation_mode", False):
+            # Explotación: parámetros fijos, temp baja, momentum alto
+            return 0.999, 0.10
+
         m_base = self.config['moco']['momentum_base']
         momentum = 1 - (1 - m_base) * (math.cos(math.pi * step / max(1, total_steps)) + 1) / 2
         
@@ -77,7 +81,9 @@ class TrainingController:
         if curr_acc >= 0: self.history['knn_acc'].append(curr_acc)
 
         is_warmup = (epoch < self.config["training"]["warmup_epochs"]) and not self.warmup_aborted
-        if not is_warmup and a_ema is not None and u_ema is not None:
+        is_exploitation = self.config.get("training", {}).get("exploitation_mode", False)
+        
+        if not is_warmup and not is_exploitation and a_ema is not None and u_ema is not None:
             current_ratio = a_ema / abs(u_ema)
             baseline = self.ema_ratio_baseline.update(current_ratio)
             ratio_norm = current_ratio / baseline if baseline > 0 else 1.0

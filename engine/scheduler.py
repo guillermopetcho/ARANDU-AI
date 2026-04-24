@@ -2,7 +2,7 @@ import torch
 
 import math
 
-def build_scheduler(opt, w_steps, t_steps, c_step=0, skip=False):
+def build_scheduler(opt, w_steps, t_steps, c_step=0, skip=False, final_lr_ratio=0.0):
     """Construye un scheduler LambdaLR con warmup lineal + decaimiento cosenoidal.
     
     Args:
@@ -12,11 +12,13 @@ def build_scheduler(opt, w_steps, t_steps, c_step=0, skip=False):
         c_step: Paso actual (usado solo con skip=True para ajustar el decaimiento).
         skip: Si True, omite el warmup y arranca directo en decaimiento cosenoidal
               desde el paso c_step. Útil para reanudación post-rollback.
+        final_lr_ratio: Fracción mínima del LR a la que decaerá al final.
     """
     if skip:
         def lr_lambda(step):
             progress = step / max(1, t_steps - c_step)
-            return 0.5 * (1.0 + math.cos(math.pi * progress))
+            decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return final_lr_ratio + (1.0 - final_lr_ratio) * decay
         return torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
         
     def lr_lambda(step):
@@ -24,7 +26,8 @@ def build_scheduler(opt, w_steps, t_steps, c_step=0, skip=False):
             return 0.01 + 0.99 * (step / max(1, w_steps))
         else:
             progress = (step - w_steps) / max(1, t_steps - w_steps)
-            return 0.5 * (1.0 + math.cos(math.pi * progress))
+            decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return final_lr_ratio + (1.0 - final_lr_ratio) * decay
             
     return torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
 

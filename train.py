@@ -12,6 +12,10 @@ import torch
 import torch.nn as nn
 import torch.distributed as dist
 import torch.backends.cudnn as cudnn
+
+# Silenciar warnings molestos de sympy/inductor durante torch.compile
+logging.getLogger("torch.utils._sympy").setLevel(logging.ERROR)
+logging.getLogger("torch._inductor").setLevel(logging.ERROR)
 from torch.utils.data import DataLoader, Subset
 from torch.utils.data.distributed import DistributedSampler
 from torch.amp import GradScaler
@@ -288,8 +292,9 @@ def main():
     
     total_steps = CONFIG["training"]["epochs"] * math.ceil(len(train_loader) / CONFIG["training"]["grad_accum_steps"])
     warmup_steps = max(1, CONFIG["training"]["warmup_epochs"] * math.ceil(len(train_loader) / CONFIG["training"]["grad_accum_steps"]))
+    final_lr_ratio = CONFIG["training"].get("final_lr_ratio", 0.0)
     
-    scheduler = build_scheduler(optimizer, warmup_steps, total_steps)
+    scheduler = build_scheduler(optimizer, warmup_steps, total_steps, final_lr_ratio=final_lr_ratio)
 
     trainer = MoCoTrainer(model_q, model_k, queue, optimizer, scheduler, scaler, CONFIG, device, is_distributed)
 
@@ -303,13 +308,20 @@ def main():
     best_ckpt_path = CONFIG["paths"].get("best_checkpoint_path", "")
     
     ckpt_to_load = None
-    if ckpt_path and os.path.exists(ckpt_path):
+    is_exploitation = CONFIG.get("training", {}).get("exploitation_mode", False)
+    
+    # En modo explotación (Fase 2), priorizamos el mejor checkpoint histórico (ej. epoch 3)
+    if is_exploitation and best_ckpt_path and os.path.exists(best_ckpt_path):
+        ckpt_to_load = best_ckpt_path
+    elif ckpt_path and os.path.exists(ckpt_path):
         ckpt_to_load = ckpt_path
     elif best_ckpt_path and os.path.exists(best_ckpt_path):
         ckpt_to_load = best_ckpt_path
         
     if ckpt_to_load:
-        if rank == 0: logger.info(f"🔄 Reanudando entrenamiento desde {ckpt_to_load}")
+        if rank == 0:
+            logger.info(f"🔄 Reanudando entrenamiento desde {ckpt_to_load} "
+                        f"{'(MODO EXPLOTACIÓN)' if is_exploitation else ''}")
         ckpt = torch.load(ckpt_to_load, map_location="cpu", weights_only=False)
         
         model_q.load_state_dict(adapt_keys(ckpt["model_q"], is_compiled, is_distributed), strict=False)
@@ -334,7 +346,7 @@ def main():
             
         # Reconstruir scheduler siempre desde cero y hacer fast-forward determinista
         # Esto evita incompatibilidades de PyTorch con SequentialLR.load_state_dict()
-        scheduler = build_scheduler(optimizer, warmup_steps, total_steps)
+        scheduler = build_scheduler(optimizer, warmup_steps, total_steps, final_lr_ratio=final_lr_ratio)
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -448,7 +460,6 @@ def main():
                     wandb.log({
                         "train/loss": metrics['loss'],
                         "train/lr": optimizer.param_groups[0]['lr'],
-                        "train/momentum_boost": controller.momentum_boost,
                         "train/temp_adj": controller.temp_adj,
                         "train/unif": metrics['unif'],
                         "train/align": metrics['align'],
@@ -463,8 +474,8 @@ def main():
                         "eval/knn_acc": curr_acc if curr_acc >= 0 else None,
                         "epoch": epoch + 1
                     }, step=global_step)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(f"Error logging to wandb: {e}")
 
         # R4 FIX: Sincronización total del estado del controlador vía DDP.
         # Rank 0 difunde la acción y el ajuste de temperatura a los demás.
@@ -514,7 +525,7 @@ def main():
             global_step = ckpt["global_step"]
             
             # Recreamos el scheduler estandar y avanzamos
-            scheduler = build_scheduler(optimizer, warmup_steps, total_steps)
+            scheduler = build_scheduler(optimizer, warmup_steps, total_steps, final_lr_ratio=final_lr_ratio)
             
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")

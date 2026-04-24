@@ -1,11 +1,13 @@
 training:
+  exploitation_mode: True # Desactiva AAC, fija temp y usa best_ckpt
   seed: 42
-  epochs: 200
-  warmup_epochs: 5
+  epochs: 18 # Entrenar 15 epochs más (si venimos de la 3)
+  warmup_epochs: 0 # Sin warmup para fine-tuning
+  final_lr_ratio: 0.1 # Para que el cosine decay termine en un LR suave y no en cero
   batch_size: 48
   grad_accum_steps: 4
   num_workers: 4
-  lr_base: 0.015
+  lr_base: 0.005 # Bajado de 0.015 para un LR final de ~0.0075
   weight_decay: 0.0001
   use_amp: True
   save_every: 10
