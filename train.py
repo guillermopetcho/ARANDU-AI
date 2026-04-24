@@ -440,7 +440,7 @@ def main():
                             writer.writeheader()
                         writer.writerow(p_stats)
                 
-            logger.info(f"Ep {epoch+1} | Loss {metrics['loss']:.3f} | U: {metrics['unif']:.2f} | LR: {optimizer.param_groups[0]['lr']:.4f} (x{controller.lr_multiplier:.2f}) | Err: {metrics.get('data_err', 0):.2f}%")
+            logger.info(f"Ep {epoch+1} | Loss {metrics['loss']:.3f} | U: {metrics['unif']:.2f} | LR: {optimizer.param_groups[0]['lr']:.4f} | Err: {metrics.get('data_err', 0):.2f}%")
             
             if use_wandb:
                 try:
@@ -448,7 +448,6 @@ def main():
                     wandb.log({
                         "train/loss": metrics['loss'],
                         "train/lr": optimizer.param_groups[0]['lr'],
-                        "train/lr_multiplier": controller.lr_multiplier,
                         "train/momentum_boost": controller.momentum_boost,
                         "train/temp_adj": controller.temp_adj,
                         "train/unif": metrics['unif'],

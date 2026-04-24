@@ -155,13 +155,7 @@ class MoCoTrainer:
 
                 self.scheduler.step()
 
-                # 🔥 Fix Pro: Aplicar multiplicador dinámico de LR
-                # El scheduler calcula el LR base del paso, y el controlador lo escala.
-                if self.controller:
-                    mult = self.controller.lr_multiplier
-                    for param_group in self.optimizer.param_groups:
-                        # Escalamos el valor calculado por el scheduler
-                        param_group['lr'] *= mult
+
                 
                 self.optimizer.zero_grad(set_to_none=True)
                 global_step += 1
