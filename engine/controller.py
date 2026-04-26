@@ -43,6 +43,20 @@ class TrainingController:
         self.ema_ratio_baseline = EMA(beta=0.99)
         self.last_ratio_ema = None
         
+        # Detector de saturación geométrica
+        self.sat_patience = 0
+        self.sat_ema = None
+        self.prev_mu = None
+        self.prev_eff_rank = None
+        self.prev_pos_sim = None
+        self.prev_neg_sim = None
+        self.prev_delta_pos = 0.0
+        self.prev_delta_neg = 0.0
+        self.best_geom_score = float('inf')
+        self.is_best_geom = False
+        self.eval_buffer = []
+        self.max_pos_sim = 0.0
+        
         # Historial
         self.history = {
             'loss': [], 'knn_acc': [], 'unif': [], 'align': [], 
@@ -108,6 +122,100 @@ class TrainingController:
                 self.patience += 1
                 if self.patience >= self.config["training"]["early_stopping_patience"]:
                     return Action.EARLY_STOP
+
+        self.is_best_geom = False
+        
+        # Detector de Saturación Geométrica
+        if 'mu' in metrics and 'eff_rank' in metrics:
+            self.eval_buffer.append({
+                'pos_sim': metrics['pos_sim'],
+                'neg_sim': metrics['neg_sim'],
+                'eff_rank': metrics['eff_rank'],
+                'mu': metrics['mu']
+            })
+            if len(self.eval_buffer) > 3:
+                self.eval_buffer.pop(0)
+
+            if len(self.eval_buffer) == 3:
+                avg_pos = sum(x['pos_sim'] for x in self.eval_buffer) / 3.0
+                avg_neg = sum(x['neg_sim'] for x in self.eval_buffer) / 3.0
+                avg_rank = sum(x['eff_rank'] for x in self.eval_buffer) / 3.0
+                avg_mu = sum(x['mu'] for x in self.eval_buffer) / 3.0
+                
+                self.max_pos_sim = max(self.max_pos_sim, avg_pos)
+                
+                if self.prev_mu is not None:
+                    # 1. Drift relativo
+                    drift = torch.norm(avg_mu - self.prev_mu).item() / (torch.norm(self.prev_mu).item() + 1e-8)
+                    
+                    # 2. Diferencias con signo para detectar degradación explícita
+                    diff_pos = avg_pos - self.prev_pos_sim
+                    diff_neg = avg_neg - self.prev_neg_sim
+                    delta_rank_abs = abs(avg_rank - self.prev_eff_rank)
+                    
+                    delta_pos_abs = abs(diff_pos)
+                    delta_neg_abs = abs(diff_neg)
+                    
+                    # Suavizado temporal de los deltas (Memoria para evitar jitter)
+                    delta_pos_smooth = 0.8 * self.prev_delta_pos + 0.2 * delta_pos_abs
+                    delta_neg_smooth = 0.8 * self.prev_delta_neg + 0.2 * delta_neg_abs
+                    self.prev_delta_pos = delta_pos_smooth
+                    self.prev_delta_neg = delta_neg_smooth
+                    
+                    # 3. Score ponderado (normalizado por escalas empíricas)
+                    sat_score = (
+                        (delta_pos_smooth / 0.01) + 
+                        (delta_neg_smooth / 0.01) + 
+                        (drift / 0.05) + 
+                        (delta_rank_abs / 0.1)
+                    )
+                    self.logger.info(f"🧬 GeoSat Score: {sat_score:.4f} | Drift: {drift:.4f} | ΔRank: {delta_rank_abs:.4f}")
+                    
+                    # 4. Señal explícita de degradación (over-spreading) con umbral de ruido y ancla KNN
+                    tau_pos, tau_neg = 1e-3, 1e-3
+                    if diff_pos < -tau_pos and diff_neg > tau_neg:
+                        self.logger.warning(f"⚠️ DEGRADACIÓN GEOMÉTRICA (over-spreading): ΔP={diff_pos:.4f}, ΔN={diff_neg:.4f}")
+                        if self.patience >= 2:
+                            self.logger.warning("→ Confirmado por KNN empírico (patience >= 2). EARLY STOP")
+                            return Action.EARLY_STOP
+                        else:
+                            self.logger.warning("→ Ignorado (KNN no muestra degradación)")
+                    
+                    # 5. Detección de "Sweet Spot" Geométrico (Mejor cristalización con calidad dinámica)
+                    if sat_score < self.best_geom_score and not is_warmup and avg_pos > 0.8 * self.max_pos_sim:
+                        self.best_geom_score = sat_score
+                        self.is_best_geom = True
+                    
+                    # 6. Baseline adaptativo (EMA de sat_score)
+                    if self.sat_ema is None:
+                        self.sat_ema = sat_score
+                    else:
+                        self.sat_ema = 0.9 * self.sat_ema + 0.1 * sat_score
+                        
+                    if sat_score < 0.5 * self.sat_ema:
+                        self.sat_patience += 1
+                        self.logger.info(f"🧊 Espacio latente congelándose... (Paciencia Geo {self.sat_patience}/3)")
+                    else:
+                        self.sat_patience = 0
+                        
+                    if self.sat_patience >= 3:
+                        self.logger.info("🧊 Embedding saturado geométricamente.")
+                        if self.patience >= 2:
+                            self.logger.info("→ Confirmado por KNN empírico (patience >= 2). EARLY STOP")
+                            return Action.EARLY_STOP
+                        else:
+                            self.logger.info("→ Ignorado (KNN sigue mejorando)")
+                        
+                self.prev_mu = avg_mu
+                self.prev_eff_rank = avg_rank
+                self.prev_pos_sim = avg_pos
+                self.prev_neg_sim = avg_neg
+            else:
+                self.prev_mu = self.eval_buffer[0]['mu']
+                self.prev_eff_rank = self.eval_buffer[0]['eff_rank']
+                self.prev_pos_sim = self.eval_buffer[0]['pos_sim']
+                self.prev_neg_sim = self.eval_buffer[0]['neg_sim']
+
         return Action.CONTINUE
 
     def state_dict(self):
@@ -121,7 +229,18 @@ class TrainingController:
             'ema_pos_sim': self.ema_pos_sim.value,
             'ema_neg_sim': self.ema_neg_sim.value,
             'ema_ratio_baseline': self.ema_ratio_baseline.value,
-            'last_ratio_ema': self.last_ratio_ema
+            'last_ratio_ema': self.last_ratio_ema,
+            'sat_patience': self.sat_patience,
+            'sat_ema': self.sat_ema,
+            'prev_mu': self.prev_mu,
+            'prev_eff_rank': self.prev_eff_rank,
+            'prev_pos_sim': self.prev_pos_sim,
+            'prev_neg_sim': self.prev_neg_sim,
+            'prev_delta_pos': self.prev_delta_pos,
+            'prev_delta_neg': self.prev_delta_neg,
+            'best_geom_score': self.best_geom_score,
+            'eval_buffer': self.eval_buffer,
+            'max_pos_sim': self.max_pos_sim
         }
 
     def load_state_dict(self, state):
@@ -138,3 +257,14 @@ class TrainingController:
         self.ema_neg_sim.value = state.get('ema_neg_sim')
         self.ema_ratio_baseline.value = state.get('ema_ratio_baseline')
         self.last_ratio_ema = state.get('last_ratio_ema')
+        self.sat_patience = state.get('sat_patience', 0)
+        self.sat_ema = state.get('sat_ema', None)
+        self.prev_mu = state.get('prev_mu', None)
+        self.prev_eff_rank = state.get('prev_eff_rank', None)
+        self.prev_pos_sim = state.get('prev_pos_sim', None)
+        self.prev_neg_sim = state.get('prev_neg_sim', None)
+        self.prev_delta_pos = state.get('prev_delta_pos', 0.0)
+        self.prev_delta_neg = state.get('prev_delta_neg', 0.0)
+        self.best_geom_score = state.get('best_geom_score', float('inf'))
+        self.eval_buffer = state.get('eval_buffer', [])
+        self.max_pos_sim = state.get('max_pos_sim', 0.0)

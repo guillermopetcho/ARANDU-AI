@@ -162,15 +162,16 @@ def main():
     
     if is_distributed:
         torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
         # T6 FIX: Aumentar timeout a 2 horas (7200s) para permitir escaneo de datasets grandes
         # sin que los ranks secundarios expiren en la barrera de build_index.
         dist.init_process_group(
             backend="nccl", 
             rank=rank, 
             world_size=world_size,
-            timeout=datetime.timedelta(seconds=7200)
+            timeout=datetime.timedelta(seconds=7200),
+            device_id=device
         )
-        device = torch.device(f"cuda:{local_rank}")
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -307,14 +308,40 @@ def main():
     ckpt_path = CONFIG["paths"].get("checkpoint_path", "")
     best_ckpt_path = CONFIG["paths"].get("best_checkpoint_path", "")
     
-    ckpt_to_load = None
     is_exploitation = CONFIG.get("training", {}).get("exploitation_mode", False)
     
-    # Priorizamos siempre el último checkpoint si existe, de lo contrario usamos el mejor histórico
-    if ckpt_path and os.path.exists(ckpt_path):
-        ckpt_to_load = ckpt_path
-    elif best_ckpt_path and os.path.exists(best_ckpt_path):
+    def get_latest_valid_checkpoint(paths_dict):
+        candidates = []
+        for k in ["checkpoint_path", "best_checkpoint_path"]:
+            p = paths_dict.get(k, "")
+            if p and os.path.exists(p):
+                candidates.append(p)
+        
+        base_dir = os.path.dirname(paths_dict.get("checkpoint_path", "/kaggle/working"))
+        if os.path.isdir(base_dir):
+            candidates.extend(glob.glob(os.path.join(base_dir, "*.pth")))
+            
+        valid_ckpts = []
+        for p in set(candidates):
+            if "resnet" in os.path.basename(p).lower():
+                continue
+            try:
+                ckpt = torch.load(p, map_location="cpu", weights_only=False)
+                if "global_step" in ckpt and "epoch" in ckpt:
+                    valid_ckpts.append((p, ckpt["global_step"]))
+            except Exception:
+                pass
+                
+        if not valid_ckpts:
+            return None
+            
+        valid_ckpts.sort(key=lambda x: x[1], reverse=True)
+        return valid_ckpts[0][0]
+
+    if is_exploitation and best_ckpt_path and os.path.exists(best_ckpt_path):
         ckpt_to_load = best_ckpt_path
+    else:
+        ckpt_to_load = get_latest_valid_checkpoint(CONFIG["paths"])
         
     if ckpt_to_load:
         if rank == 0:
@@ -393,6 +420,21 @@ def main():
                 curr_acc = fast_knn(X_t, y_t, X_v, y_v, k=CONFIG["eval"]["knn_k"])
                 logger.info(f"KNN ACC: {curr_acc:.4f}")
                 
+                # Calcular geométricas
+                X_v_t = torch.tensor(X_v)
+                mu = X_v_t.mean(dim=0)
+                
+                # SVD con datos centrados
+                X_centered = X_v_t - mu.unsqueeze(0)
+                s = torch.linalg.svdvals(X_centered)
+                p = (s**2) / ((s**2).sum() + 1e-8)
+                p = torch.clamp(p, min=1e-6)
+                p = p / p.sum()
+                eff_rank = torch.exp(-(p * torch.log(p)).sum()).item()
+                
+                metrics['mu'] = mu  # Sin normalizar para el drift relativo
+                metrics['eff_rank'] = eff_rank
+                
                 # Delegar decisiones lógicas al Controlador Adaptativo
                 action = controller.step_epoch(epoch, curr_acc, metrics)
                 
@@ -423,6 +465,14 @@ def main():
                     torch.save(ckpt, tmp_best_path)
                     os.replace(tmp_best_path, CONFIG["paths"]["best_checkpoint_path"])
                     logger.info("🏆 Best model guardado")
+                
+                # 💎 Sweet Spot Geométrico:
+                if getattr(controller, 'is_best_geom', False):
+                    geom_ckpt_path = CONFIG["paths"]["checkpoint_path"].replace('.pth', '_best_geom.pth')
+                    tmp_geom_path = geom_ckpt_path + ".tmp"
+                    torch.save(ckpt, tmp_geom_path)
+                    os.replace(tmp_geom_path, geom_ckpt_path)
+                    logger.info("💎 Best Geometric model guardado")
 
             log_buffer.append([
                 epoch+1, metrics['loss'], optimizer.param_groups[0]['lr'], curr_acc,
@@ -483,7 +533,7 @@ def main():
                     'action': stop_signal.item(),
                     'temp_adj': controller.temp_adj
                 }
-            dist.barrier()
+            dist.barrier(device_ids=[local_rank])
             dist.broadcast_object_list(sync_data, src=0)
             
             if rank != 0:

@@ -132,7 +132,7 @@ def build_index(root, rank, cache_path):
     
     # 2. Barrera crítica: todos esperan a que Rank 0 termine de escribir en disco
     if is_dist:
-        dist.barrier()
+        dist.barrier(device_ids=[torch.cuda.current_device()])
     
     # 3. Todos cargan el mismo archivo (ahora garantizado que existe y está completo)
     if not os.path.exists(cache_path):
