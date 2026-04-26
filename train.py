@@ -310,10 +310,8 @@ def main():
     ckpt_to_load = None
     is_exploitation = CONFIG.get("training", {}).get("exploitation_mode", False)
     
-    # En modo explotación (Fase 2), priorizamos el mejor checkpoint histórico (ej. epoch 3)
-    if is_exploitation and best_ckpt_path and os.path.exists(best_ckpt_path):
-        ckpt_to_load = best_ckpt_path
-    elif ckpt_path and os.path.exists(ckpt_path):
+    # Priorizamos siempre el último checkpoint si existe, de lo contrario usamos el mejor histórico
+    if ckpt_path and os.path.exists(ckpt_path):
         ckpt_to_load = ckpt_path
     elif best_ckpt_path and os.path.exists(best_ckpt_path):
         ckpt_to_load = best_ckpt_path
