@@ -173,14 +173,22 @@ class TrainingController:
                     self.logger.info(f"🧬 GeoSat Score: {sat_score:.4f} | Drift: {drift:.4f} | ΔRank: {delta_rank_abs:.4f}")
                     
                     # 4. Señal explícita de degradación (over-spreading) con umbral de ruido y ancla KNN
-                    tau_pos, tau_neg = 1e-3, 1e-3
-                    if diff_pos < -tau_pos and diff_neg > tau_neg:
-                        self.logger.warning(f"⚠️ DEGRADACIÓN GEOMÉTRICA (over-spreading): ΔP={diff_pos:.4f}, ΔN={diff_neg:.4f}")
-                        if self.patience >= 2:
-                            self.logger.warning("→ Confirmado por KNN empírico (patience >= 2). EARLY STOP")
-                            return Action.EARLY_STOP
-                        else:
-                            self.logger.warning("→ Ignorado (KNN no muestra degradación)")
+                    # 4. Señal explícita de degradación con ancla empírica (KNN patience)
+                    # Una caída sostenida en KNN (patience >= 2) combinada con inestabilidad
+                    # en el rango efectivo o "over-spreading" (Uniformidad muy negativa).
+                    if self.patience >= 2:
+                        unif_val = self.history['unif'][-1] if self.history['unif'] else 0.0
+                        if delta_rank_abs > 0.5 or unif_val < -2.2:
+                            self.logger.warning(f"⚠️ DEGRADACIÓN SEVERA DETECTADA: ΔRank={delta_rank_abs:.4f}, U={unif_val:.2f}")
+                            self.logger.warning("→ Confirmado por KNN empírico (patience >= 2). Iniciando ROLLBACK para rescatar la representación.")
+                            return Action.ROLLBACK
+                        
+                        # Fallback a la heurística antigua si las métricas globales no son tan extremas
+                        tau_pos, tau_neg = 1e-3, 1e-3
+                        if diff_pos < -tau_pos and diff_neg > tau_neg:
+                            self.logger.warning(f"⚠️ DEGRADACIÓN GEOMÉTRICA (over-spreading leve): ΔP={diff_pos:.4f}, ΔN={diff_neg:.4f}")
+                            self.logger.warning("→ Confirmado por KNN empírico. Iniciando ROLLBACK.")
+                            return Action.ROLLBACK
                     
                     # 5. Detección de "Sweet Spot" Geométrico (Mejor cristalización con calidad dinámica)
                     if sat_score < self.best_geom_score and not is_warmup and avg_pos > 0.8 * self.max_pos_sim:
