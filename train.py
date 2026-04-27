@@ -338,7 +338,9 @@ def main():
         valid_ckpts.sort(key=lambda x: x[1], reverse=True)
         return valid_ckpts[0][0]
 
-    if is_exploitation and best_ckpt_path and os.path.exists(best_ckpt_path):
+    if ckpt_path and os.path.exists(ckpt_path):
+        ckpt_to_load = get_latest_valid_checkpoint(CONFIG["paths"])
+    elif best_ckpt_path and os.path.exists(best_ckpt_path):
         ckpt_to_load = best_ckpt_path
     else:
         ckpt_to_load = get_latest_valid_checkpoint(CONFIG["paths"])
