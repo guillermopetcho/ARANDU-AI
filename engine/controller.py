@@ -174,20 +174,21 @@ class TrainingController:
                     
                     # 4. Señal explícita de degradación (over-spreading) con umbral de ruido y ancla KNN
                     # 4. Señal explícita de degradación con ancla empírica (KNN patience)
-                    # Una caída sostenida en KNN (patience >= 2) combinada con inestabilidad
-                    # en el rango efectivo o "over-spreading" (Uniformidad muy negativa).
+                    unif_val = self.history['unif'][-1] if self.history['unif'] else 0.0
+                    
+                    # A. Degradación Extrema: Rango explotando o repulsión masiva.
+                    # No esperamos 2 épocas (ahorramos 50 min de Kaggle) si la inestabilidad es obvia.
+                    if self.patience >= 1 and (delta_rank_abs > 0.6 or unif_val < -2.2):
+                        self.logger.warning(f"⚠️ DEGRADACIÓN SEVERA DETECTADA: ΔRank={delta_rank_abs:.4f}, U={unif_val:.2f}")
+                        self.logger.warning("→ Confirmado por caída inmediata de KNN (patience >= 1). Iniciando ROLLBACK preventivo.")
+                        return Action.ROLLBACK
+                    
+                    # B. Degradación Moderada (over-spreading leve)
                     if self.patience >= 2:
-                        unif_val = self.history['unif'][-1] if self.history['unif'] else 0.0
-                        if delta_rank_abs > 0.5 or unif_val < -2.2:
-                            self.logger.warning(f"⚠️ DEGRADACIÓN SEVERA DETECTADA: ΔRank={delta_rank_abs:.4f}, U={unif_val:.2f}")
-                            self.logger.warning("→ Confirmado por KNN empírico (patience >= 2). Iniciando ROLLBACK para rescatar la representación.")
-                            return Action.ROLLBACK
-                        
-                        # Fallback a la heurística antigua si las métricas globales no son tan extremas
                         tau_pos, tau_neg = 1e-3, 1e-3
                         if diff_pos < -tau_pos and diff_neg > tau_neg:
                             self.logger.warning(f"⚠️ DEGRADACIÓN GEOMÉTRICA (over-spreading leve): ΔP={diff_pos:.4f}, ΔN={diff_neg:.4f}")
-                            self.logger.warning("→ Confirmado por KNN empírico. Iniciando ROLLBACK.")
+                            self.logger.warning("→ Confirmado por KNN empírico (patience >= 2). Iniciando ROLLBACK.")
                             return Action.ROLLBACK
                     
                     # 5. Detección de "Sweet Spot" Geométrico (Mejor cristalización con calidad dinámica)
