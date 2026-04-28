@@ -207,7 +207,7 @@ class TrainingController:
                     # Desacople Temporal (EMAs de Errores)
                     self.eU_ema = 0.7 * self.eU_ema + 0.3 * eU_norm
                     self.eD_ema = 0.9 * self.eD_ema + 0.1 * eD_norm
-                    self.eR_ema = 0.95 * self.eR_ema + 0.05 * corrected_eR
+                    self.eR_ema = 0.85 * self.eR_ema + 0.15 * corrected_eR
                     
                     # Deadband (Zona Muerta) APLICADA DESPUÉS DEL EMA para evitar sesgos nulos
                     def deadband(x, threshold=0.1):
@@ -215,7 +215,7 @@ class TrainingController:
                     
                     eU_ctrl = deadband(self.eU_ema, 0.1)
                     eD_ctrl = deadband(self.eD_ema, 0.1)
-                    eR_ctrl = deadband(self.eR_ema, 0.1)
+                    eR_ctrl = deadband(self.eR_ema, 0.05)
                     
                     # --- Eje A: Termostato de Repulsión (Control PI) ---
                     # Integral más pura con un leak muy suave para corregir offsets reales
@@ -244,6 +244,14 @@ class TrainingController:
                     # --- Eje C: Amortiguador de LR Reversible ---
                     Kp_lr = 0.5
                     old_scale = self.lr_scale
+                    
+                    # REFLEJO ESPINAL: Control reactivo bypass de emergencia
+                    if delta_rank_abs > 0.7:
+                        emergency_factor = math.exp(-1.5 * (delta_rank_abs - 0.7))
+                        self.lr_scale *= emergency_factor
+                        self.logger.warning(f"⚡ Reflejo de Emergencia: Varianza extrema ({delta_rank_abs:.4f}). Hachazo instantáneo al LR.")
+                        
+                    # CONTROL CONTINUO: PID latente estándar
                     if eR_ctrl > 0:
                         # Penalización fuerte y rápida (riesgo inminente)
                         self.lr_scale *= math.exp(-Kp_lr * eR_ctrl)
@@ -257,16 +265,21 @@ class TrainingController:
                     self.logger.info(f"⚙️ PID: Tau={self.tau:.4f} | Mom={self.current_m:.5f} | LR_Scale={self.lr_scale:.3f} | TauRankCoef={self.tau_rank_coef:.3f}")
                     # ----------------------------------------------------------
                     
-                    # 4. Señal explícita de degradación (over-spreading) con umbral de ruido y ancla KNN
                     # 4. Señal explícita de degradación con ancla empírica (KNN patience)
                     unif_val = self.history['unif'][-1] if self.history['unif'] else 0.0
                     
                     # A. Degradación Extrema: Rango explotando o repulsión masiva.
                     # No esperamos 2 épocas (ahorramos 50 min de Kaggle) si la inestabilidad es obvia.
-                    if self.patience >= 1 and (delta_rank_abs > 0.6 or unif_val < -2.2):
+                    if delta_rank_abs > 0.6 or unif_val < -2.2:
                         self.logger.warning(f"⚠️ DEGRADACIÓN SEVERA DETECTADA: ΔRank={delta_rank_abs:.4f}, U={unif_val:.2f}")
-                        self.logger.warning("→ Confirmado por caída inmediata de KNN (patience >= 1). Iniciando ROLLBACK preventivo.")
-                        return Action.ROLLBACK
+                        if self.patience >= 1:
+                            # Condicionamos el Rollback: Solo se hace Rollback preventivo 
+                            # si el optimizador ya frenó (PID superado) o el manifold explotó por temperatura baja
+                            if self.lr_scale < 0.5 or unif_val < -2.2:
+                                self.logger.warning("→ Confirmado por caída de KNN y PID sin efecto. Iniciando ROLLBACK preventivo.")
+                                return Action.ROLLBACK
+                            else:
+                                self.logger.warning("🛡️ PID actuando sobre el LR. Dando tiempo al manifold antes de forzar Rollback.")
                     
                     # B. Degradación Moderada (over-spreading leve)
                     if self.patience >= 2:
