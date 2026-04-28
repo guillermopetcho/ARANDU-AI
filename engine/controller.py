@@ -52,6 +52,8 @@ class TrainingController:
         self.tau_rank_coef = 0.5
         self.prev_tau = self.tau
         
+        self.crisis_counter = 0 # Contador de shocks consecutivos
+        
         # Observadores Suavizados (EMA)
         self.ema_unif = EMA(beta=0.9)
         self.ema_align = EMA(beta=0.9)
@@ -247,9 +249,20 @@ class TrainingController:
                     
                     # REFLEJO ESPINAL: Control reactivo bypass de emergencia
                     if delta_rank_abs > 0.7:
+                        self.crisis_counter += 1
                         emergency_factor = math.exp(-1.5 * (delta_rank_abs - 0.7))
                         self.lr_scale *= emergency_factor
                         self.logger.warning(f"⚡ Reflejo de Emergencia: Varianza extrema ({delta_rank_abs:.4f}). Hachazo instantáneo al LR.")
+                    else:
+                        self.crisis_counter = 0
+                        
+                    # MODO SUPERVIVENCIA ESTRUCTURAL (2da Ola de Crisis)
+                    if self.crisis_counter >= 2:
+                        self.logger.warning("🚨 SEGUNDA OLA DE CRISIS DETECTADA. Cambiando a control estructural (subiendo Tau).")
+                        self.tau += 0.03
+                        self.tau = max(min(self.tau, 0.25), 0.05)
+                        # No asfixiamos más al optimizador, el problema es estructural
+                        self.lr_scale = max(self.lr_scale, 0.4)
                         
                     # CONTROL CONTINUO: PID latente estándar
                     if eR_ctrl > 0:
@@ -274,12 +287,12 @@ class TrainingController:
                         self.logger.warning(f"⚠️ DEGRADACIÓN SEVERA DETECTADA: ΔRank={delta_rank_abs:.4f}, U={unif_val:.2f}")
                         if self.patience >= 1:
                             # Condicionamos el Rollback: Solo se hace Rollback preventivo 
-                            # si el optimizador ya frenó (PID superado) o el manifold explotó por temperatura baja
-                            if self.lr_scale < 0.5 or unif_val < -2.2:
-                                self.logger.warning("→ Confirmado por caída de KNN y PID sin efecto. Iniciando ROLLBACK preventivo.")
+                            # si el optimizador ya frenó y el manifold no se arregló tras varios shocks
+                            if self.lr_scale < 0.3 and self.crisis_counter >= 2:
+                                self.logger.warning("→ Confirmado por caída de KNN en crisis estructural prolongada. Iniciando ROLLBACK preventivo.")
                                 return Action.ROLLBACK
                             else:
-                                self.logger.warning("🛡️ PID actuando sobre el LR. Dando tiempo al manifold antes de forzar Rollback.")
+                                self.logger.warning("🛡️ Modo Supervivencia activo. Dando tiempo al manifold antes de forzar Rollback.")
                     
                     # B. Degradación Moderada (over-spreading leve)
                     if self.patience >= 2:
@@ -360,7 +373,8 @@ class TrainingController:
             'I_U': self.I_U,
             'steps': self.steps,
             'tau_rank_coef': self.tau_rank_coef,
-            'prev_tau': self.prev_tau
+            'prev_tau': self.prev_tau,
+            'crisis_counter': getattr(self, 'crisis_counter', 0)
         }
 
     def load_state_dict(self, state):
@@ -403,6 +417,7 @@ class TrainingController:
         
         self.tau_rank_coef = state.get('tau_rank_coef', 0.5)
         self.prev_tau = state.get('prev_tau', self.tau)
+        self.crisis_counter = state.get('crisis_counter', 0)
         
         # Evitar decisiones agresivas post-resume (Cold start penalty)
         warmup_factor = min(1.0, self.steps / 100.0) if self.steps > 0 else 1.0
