@@ -510,7 +510,9 @@ def main():
                     wandb.log({
                         "train/loss": metrics['loss'],
                         "train/lr": optimizer.param_groups[0]['lr'],
-                        "train/temp_adj": controller.temp_adj,
+                        "train/tau": controller.tau,
+                        "train/momentum": controller.current_m,
+                        "train/lr_scale": controller.lr_scale,
                         "train/unif": metrics['unif'],
                         "train/align": metrics['align'],
                         "train/pos_sim": metrics['pos_sim'],
@@ -521,6 +523,12 @@ def main():
                         "train/neg_loss": metrics['neg'],
                         "train/tput": metrics['tput'],
                         "train/data_error_rate": metrics.get('data_err', 0),
+                        "pid/eU_ema": controller.eU_ema,
+                        "pid/eD_ema": controller.eD_ema,
+                        "pid/eR_ema": controller.eR_ema,
+                        "pid/I_U": controller.I_U,
+                        "pid/tau_rank_coef": controller.tau_rank_coef,
+                        "pid/lr_step_factor": controller.lr_step_factor,
                         "eval/knn_acc": curr_acc if curr_acc >= 0 else None,
                         "epoch": epoch + 1
                     }, step=global_step)
@@ -528,19 +536,34 @@ def main():
                     logger.warning(f"Error logging to wandb: {e}")
 
         # R4 FIX: Sincronización total del estado del controlador vía DDP.
-        # Rank 0 difunde la acción y el ajuste de temperatura a los demás.
+        # Rank 0 difunde la acción y los valores del Auto-Tuner a los demás.
         if is_distributed:
             if rank == 0:
                 sync_data[0] = {
                     'action': stop_signal.item(),
-                    'temp_adj': controller.temp_adj
+                    'tau': controller.tau,
+                    'current_m': controller.current_m,
+                    'lr_step_factor': controller.lr_step_factor,
+                    'lr_scale': controller.lr_scale
                 }
             dist.barrier(device_ids=[local_rank])
             dist.broadcast_object_list(sync_data, src=0)
             
             if rank != 0:
                 stop_signal.fill_(sync_data[0]['action'])
-                controller.temp_adj = sync_data[0]['temp_adj']
+                controller.tau = sync_data[0]['tau']
+                controller.current_m = sync_data[0]['current_m']
+                controller.lr_step_factor = sync_data[0]['lr_step_factor']
+                controller.lr_scale = sync_data[0]['lr_scale']
+                
+        # 🛡️ Aplicar amortiguación/recuperación dinámica de LR
+        if controller.lr_step_factor != 1.0:
+            for param_group in optimizer.param_groups:
+                param_group['lr'] *= controller.lr_step_factor
+                param_group['initial_lr'] *= controller.lr_step_factor
+            controller.lr_step_factor = 1.0  # Consumido
+
+
         
         if stop_signal.item() == 2:
             if rank == 0: logger.info("🔄 Iniciando proceso de Rollback...")
@@ -564,11 +587,12 @@ def main():
             model_k.load_state_dict(adapt_keys(ckpt["model_k"], is_compiled, False), strict=False)
             optimizer.load_state_dict(ckpt["optimizer"])
             
-            # 🔥 Fix Pro: Bajar el LR a la mitad para estabilizar inmediatamente tras el rollback
-            # Sanitizamos explícitamente todo el optimizador para la nueva curva térmica
+            # 🔥 Fix Pro: Bajar el LR a la mitad progresivamente tras cada rollback
+            # Usamos el initial_lr previo para que cada rollback consecutivo lo reduzca un 50% más.
             for param_group in optimizer.param_groups:
-                param_group['initial_lr'] = lr * 0.5  # Modificar toda la curva base
-                param_group['lr'] = lr * 0.5
+                new_lr = param_group['initial_lr'] * 0.5
+                param_group['initial_lr'] = new_lr
+                param_group['lr'] = new_lr
                 
             scaler.load_state_dict(ckpt["scaler"])
             queue.load_state_dict(ckpt["queue"])

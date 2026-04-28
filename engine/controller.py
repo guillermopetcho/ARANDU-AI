@@ -36,6 +36,22 @@ class TrainingController:
         self.warmup_aborted = False
         self.temp_adj = 0.0
         
+        # Estado PID Geométrico (Control Continuo Acoplado)
+        self.tau = config['moco']['temp_end'] if 'moco' in config else 0.10
+        self.alpha = 1.0 - (config['moco']['momentum_base'] if 'moco' in config else 0.999)
+        self.current_m = 1.0 - self.alpha
+        self.lr_scale = 1.0
+        self.lr_step_factor = 1.0
+        
+        self.eU_ema = 0.0
+        self.eD_ema = 0.0
+        self.eR_ema = 0.0
+        self.I_U = 0.0
+        self.steps = 0
+        
+        self.tau_rank_coef = 0.5
+        self.prev_tau = self.tau
+        
         # Observadores Suavizados (EMA)
         self.ema_unif = EMA(beta=0.9)
         self.ema_align = EMA(beta=0.9)
@@ -65,24 +81,12 @@ class TrainingController:
         }
 
     def get_dynamic_hyperparams(self, step, total_steps, metrics=None):
-        if self.config.get("training", {}).get("exploitation_mode", False):
-            # Explotación: parámetros fijos, temp baja, momentum alto
-            return 0.999, 0.10
-
-        m_base = self.config['moco']['momentum_base']
-        momentum = 1 - (1 - m_base) * (math.cos(math.pi * step / max(1, total_steps)) + 1) / 2
-        
-        t_start = self.config['moco']['temp_start']
-        t_end = self.config['moco']['temp_end']
-        progress = min(step / max(1, total_steps), 1.0)
-        temp_base = t_end + (t_start - t_end) * 0.5 * (1 + math.cos(math.pi * progress))
-        
-        # El ajuste temp_adj es sincronizado vía DDP en train.py
-        final_temp = max(min(temp_base + self.temp_adj, 0.2), 0.05)
-            
-        return momentum, final_temp
+        # Auto-Tuner Geométrico (PID Latente):
+        return self.current_m, self.tau
 
     def step_epoch(self, epoch, curr_acc, metrics):
+        self.steps += 1
+        
         u_ema = self.ema_unif.update(metrics['unif'])
         a_ema = self.ema_align.update(metrics['align'])
         ps_ema = self.ema_pos_sim.update(metrics['pos_sim'])
@@ -172,6 +176,87 @@ class TrainingController:
                     )
                     self.logger.info(f"🧬 GeoSat Score: {sat_score:.4f} | Drift: {drift:.4f} | ΔRank: {delta_rank_abs:.4f}")
                     
+                    # ---- PID LATENTE CONTINUO (Auto-Tuner Nivel Research) ----
+                    unif_val = self.history['unif'][-1] if self.history['unif'] else 0.0
+                    
+                    # Errores crudos respecto a los targets ideales
+                    eU_raw = (-1.8) - unif_val
+                    eD_raw = drift - 0.05
+                    eR_raw = delta_rank_abs - 0.1
+                    
+                    # Normalización empírica (Sigma)
+                    eU_norm = eU_raw / 0.5
+                    eD_norm = eD_raw / 0.1
+                    eR_norm = eR_raw / 0.5
+                    
+                    # Desacople Feed-Forward Adaptativo: La temperatura alta causa que el rank caiga
+                    if epoch > 0 and self.prev_eff_rank is not None:
+                        observed_rank_change = avg_rank - self.prev_eff_rank
+                        delta_tau = self.tau - self.prev_tau
+                        if abs(delta_tau) > 1e-4:
+                            empirical_coef = observed_rank_change / delta_tau
+                            # Clamp para evitar locuras por ruido
+                            empirical_coef = max(min(empirical_coef, 2.0), -2.0)
+                            adapt_rate = 0.01 if abs(delta_tau) > 0.01 else 0.001
+                            self.tau_rank_coef = (1.0 - adapt_rate) * self.tau_rank_coef + adapt_rate * empirical_coef
+                    self.prev_tau = self.tau
+                    
+                    tau_effect = (self.tau - 0.1) * self.tau_rank_coef
+                    corrected_eR = eR_norm + tau_effect
+                    
+                    # Desacople Temporal (EMAs de Errores)
+                    self.eU_ema = 0.7 * self.eU_ema + 0.3 * eU_norm
+                    self.eD_ema = 0.9 * self.eD_ema + 0.1 * eD_norm
+                    self.eR_ema = 0.95 * self.eR_ema + 0.05 * corrected_eR
+                    
+                    # Deadband (Zona Muerta) APLICADA DESPUÉS DEL EMA para evitar sesgos nulos
+                    def deadband(x, threshold=0.1):
+                        return 0.0 if abs(x) < threshold else x
+                    
+                    eU_ctrl = deadband(self.eU_ema, 0.1)
+                    eD_ctrl = deadband(self.eD_ema, 0.1)
+                    eR_ctrl = deadband(self.eR_ema, 0.1)
+                    
+                    # --- Eje A: Termostato de Repulsión (Control PI) ---
+                    # Integral más pura con un leak muy suave para corregir offsets reales
+                    self.I_U += eU_ctrl
+                    self.I_U *= 0.99
+                    if eU_ctrl * self.I_U < 0:
+                        self.I_U *= 0.9 # Descarga rápida si cruza el target
+                    self.I_U = max(min(self.I_U, 5.0), -5.0) # Clamp
+                    
+                    Kp_tau = 0.02
+                    Ki_tau = Kp_tau / 50.0
+                    self.tau += Kp_tau * eU_ctrl + Ki_tau * self.I_U
+                    
+                    # Anti-Windup Dinámico
+                    if self.tau >= 0.25 or self.tau <= 0.05:
+                        self.I_U *= 0.9 # Leak cuando está saturado
+                    
+                    self.tau = max(min(self.tau, 0.25), 0.05)
+                    
+                    # --- Eje B: Freno de Inercia (Control P sobre Alpha) ---
+                    Kp_alpha = 0.005
+                    self.alpha -= Kp_alpha * eD_ctrl
+                    self.alpha = max(min(self.alpha, 0.05), 1e-5) # Momentum [0.95, 0.99999]
+                    self.current_m = 1.0 - self.alpha
+                    
+                    # --- Eje C: Amortiguador de LR Reversible ---
+                    Kp_lr = 0.5
+                    old_scale = self.lr_scale
+                    if eR_ctrl > 0:
+                        # Penalización fuerte y rápida (riesgo inminente)
+                        self.lr_scale *= math.exp(-Kp_lr * eR_ctrl)
+                    else:
+                        # Recuperación lenta y controlada (salida del colapso)
+                        self.lr_scale *= math.exp(-0.1 * Kp_lr * eR_ctrl)
+                        
+                    self.lr_scale = max(min(self.lr_scale, 1.0), 0.1)
+                    self.lr_step_factor = self.lr_scale / old_scale if old_scale > 0 else 1.0
+                    
+                    self.logger.info(f"⚙️ PID: Tau={self.tau:.4f} | Mom={self.current_m:.5f} | LR_Scale={self.lr_scale:.3f} | TauRankCoef={self.tau_rank_coef:.3f}")
+                    # ----------------------------------------------------------
+                    
                     # 4. Señal explícita de degradación (over-spreading) con umbral de ruido y ancla KNN
                     # 4. Señal explícita de degradación con ancla empírica (KNN patience)
                     unif_val = self.history['unif'][-1] if self.history['unif'] else 0.0
@@ -250,7 +335,19 @@ class TrainingController:
             'prev_delta_neg': self.prev_delta_neg,
             'best_geom_score': self.best_geom_score,
             'eval_buffer': self.eval_buffer,
-            'max_pos_sim': self.max_pos_sim
+            'max_pos_sim': self.max_pos_sim,
+            'tau': self.tau,
+            'alpha': self.alpha,
+            'current_m': self.current_m,
+            'lr_scale': self.lr_scale,
+            'lr_step_factor': self.lr_step_factor,
+            'eU_ema': self.eU_ema,
+            'eD_ema': self.eD_ema,
+            'eR_ema': self.eR_ema,
+            'I_U': self.I_U,
+            'steps': self.steps,
+            'tau_rank_coef': self.tau_rank_coef,
+            'prev_tau': self.prev_tau
         }
 
     def load_state_dict(self, state):
@@ -278,3 +375,25 @@ class TrainingController:
         self.best_geom_score = state.get('best_geom_score', float('inf'))
         self.eval_buffer = state.get('eval_buffer', [])
         self.max_pos_sim = state.get('max_pos_sim', 0.0)
+        
+        self.tau = state.get('tau', self.tau)
+        self.alpha = state.get('alpha', self.alpha)
+        self.current_m = state.get('current_m', self.current_m)
+        self.lr_scale = state.get('lr_scale', self.lr_scale)
+        self.lr_step_factor = state.get('lr_step_factor', 1.0)
+        
+        self.eU_ema = state.get('eU_ema', 0.0)
+        self.eD_ema = state.get('eD_ema', 0.0)
+        self.eR_ema = state.get('eR_ema', 0.0)
+        self.I_U = state.get('I_U', 0.0)
+        self.steps = state.get('steps', 0)
+        
+        self.tau_rank_coef = state.get('tau_rank_coef', 0.5)
+        self.prev_tau = state.get('prev_tau', self.tau)
+        
+        # Evitar decisiones agresivas post-resume (Cold start penalty)
+        warmup_factor = min(1.0, self.steps / 100.0) if self.steps > 0 else 1.0
+        self.eU_ema *= warmup_factor
+        self.eD_ema *= warmup_factor
+        self.eR_ema *= warmup_factor
+
