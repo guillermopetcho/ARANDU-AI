@@ -219,6 +219,9 @@ class TrainingController:
                     eD_ctrl = deadband(self.eD_ema, 0.1)
                     eR_ctrl = deadband(self.eR_ema, 0.05)
                     
+                    # Bandera para suspender el PID termostático si hay crisis
+                    use_pid_tau = True
+                    
                     # --- Eje A: Termostato de Repulsión (Control PI) ---
                     # Integral más pura con un leak muy suave para corregir offsets reales
                     self.I_U += eU_ctrl
@@ -229,13 +232,8 @@ class TrainingController:
                     
                     Kp_tau = 0.02
                     Ki_tau = Kp_tau / 50.0
-                    self.tau += Kp_tau * eU_ctrl + Ki_tau * self.I_U
+                    # La actualización se realiza al final, si use_pid_tau es True
                     
-                    # Anti-Windup Dinámico
-                    if self.tau >= 0.25 or self.tau <= 0.05:
-                        self.I_U *= 0.9 # Leak cuando está saturado
-                    
-                    self.tau = max(min(self.tau, 0.25), 0.05)
                     
                     # --- Eje B: Freno de Inercia (Control P sobre Alpha) ---
                     Kp_alpha = 0.005
@@ -248,21 +246,44 @@ class TrainingController:
                     old_scale = self.lr_scale
                     
                     # REFLEJO ESPINAL: Control reactivo bypass de emergencia
-                    if delta_rank_abs > 0.7:
+                    # Umbral adaptativo: Mezcla señal rápida y lenta para no reaccionar tarde
+                    adaptive_threshold = max(0.7, 0.5 * self.eR_ema + 0.5 * delta_rank_abs)
+                    
+                    if delta_rank_abs > adaptive_threshold:
                         self.crisis_counter += 1
-                        emergency_factor = math.exp(-1.5 * (delta_rank_abs - 0.7))
+                        emergency_factor = math.exp(-1.5 * (delta_rank_abs - adaptive_threshold))
                         self.lr_scale *= emergency_factor
-                        self.logger.warning(f"⚡ Reflejo de Emergencia: Varianza extrema ({delta_rank_abs:.4f}). Hachazo instantáneo al LR.")
-                    else:
-                        self.crisis_counter = 0
+                        self.logger.warning(f"⚡ Reflejo de Emergencia: Varianza extrema ({delta_rank_abs:.4f} > {adaptive_threshold:.4f}). Hachazo instantáneo al LR.")
+                    elif delta_rank_abs < 0.5:
+                        self.crisis_counter = max(0, self.crisis_counter - 1)
                         
                     # MODO SUPERVIVENCIA ESTRUCTURAL (2da Ola de Crisis)
                     if self.crisis_counter >= 2:
-                        self.logger.warning("🚨 SEGUNDA OLA DE CRISIS DETECTADA. Cambiando a control estructural (subiendo Tau).")
-                        self.tau += 0.03
+                        tau_boost = 0.02 * min(2.0, delta_rank_abs)
+                        self.logger.warning(f"🚨 SEGUNDA OLA DE CRISIS DETECTADA. Control estructural (Tau +{tau_boost:.4f}).")
+                        self.tau += tau_boost
                         self.tau = max(min(self.tau, 0.25), 0.05)
                         # No asfixiamos más al optimizador, el problema es estructural
                         self.lr_scale = max(self.lr_scale, 0.4)
+                        use_pid_tau = False
+                    elif self.crisis_counter == 0:
+                        # ENFRIAMIENTO POST-CRISIS: Disipamos el calor residual suavemente
+                        self.tau *= 0.995
+                        # ANCLAJE SUAVE: Evitamos el 'creep térmico' a largo plazo
+                        tau_target = 0.10
+                        self.tau += 0.01 * (tau_target - self.tau)
+                        # DESCONGELAMIENTO DE MOMENTUM: Evitamos saturación crónica (m -> 0.99)
+                        self.alpha = min(self.alpha + 1e-4, 0.01)
+                        
+                    if use_pid_tau:
+                        self.tau += Kp_tau * eU_ctrl + Ki_tau * self.I_U
+                        # Anclaje suave de PID también para evitar drift
+                        tau_target = 0.10
+                        self.tau += 0.01 * (tau_target - self.tau)
+                        # Anti-Windup Dinámico
+                        if self.tau >= 0.25 or self.tau <= 0.05:
+                            self.I_U *= 0.9 # Leak cuando está saturado
+                        self.tau = max(min(self.tau, 0.25), 0.05)
                         
                     # CONTROL CONTINUO: PID latente estándar
                     if eR_ctrl > 0:
