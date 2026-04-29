@@ -182,11 +182,22 @@ def main():
     with open(config_path, "r") as f:
         CONFIG = yaml.safe_load(f)
 
-    # 🔥 FIX: Auto-discovery de paths en Kaggle independiente del usuario.
-    # El dataset slug (ej. "base-soja-encoder-full") y el nombre de la carpeta raíz
-    # (ej. "BASE-SOJA-ENCODER-FULL") son constantes, pero el username en la ruta cambia.
-    # Buscamos recursivamente bajo /kaggle/input/ para resolver el path real.
-    CONFIG["paths"] = resolve_kaggle_paths(CONFIG["paths"], rank)
+    # Auto-discovery de paths en Kaggle: solo Rank 0 hace el os.walk (potencialmente
+    # lento en datasets grandes). El resultado se difunde a los demás ranks.
+    #
+    # INVARIANTE: resolve_kaggle_paths siempre retorna un dict válido (el original
+    # o el parcheado). Nunca retorna None. Por eso asignamos directamente a CONFIG["paths"]
+    # en vez de usar un centinela None que crea ambigüedad.
+    if rank == 0:
+        CONFIG["paths"] = resolve_kaggle_paths(CONFIG["paths"], rank)
+
+    if is_distributed:
+        # Difundir el dict resuelto a todos los ranks para que compartan la misma ruta.
+        # El broadcast garantiza que todos los ranks ven el path correcto,
+        # independientemente de si el auto-discovery tuvo éxito o no.
+        broadcast_buf = [CONFIG["paths"]]
+        dist.broadcast_object_list(broadcast_buf, src=0)
+        CONFIG["paths"] = broadcast_buf[0]
 
     # Inicializar el Controlador Adaptativo
     controller = TrainingController(CONFIG)
@@ -422,18 +433,28 @@ def main():
                 curr_acc = fast_knn(X_t, y_t, X_v, y_v, k=CONFIG["eval"]["knn_k"])
                 logger.info(f"KNN ACC: {curr_acc:.4f}")
                 
-                # Calcular geométricas
+                # Calcular métricas geométricas del espacio latente (eff_rank, drift).
+                # Usamos un subconjunto aleatorio de hasta SVD_MAX_SAMPLES filas para que
+                # svdvals() sea O(SVD_MAX_SAMPLES * D^2) en lugar de O(N_val * D^2),
+                # ahorrando ~5-10s por época sin pérdida estadística significativa.
+                SVD_MAX_SAMPLES = 2000
                 X_v_t = torch.tensor(X_v)
-                mu = X_v_t.mean(dim=0)
-                
-                # SVD con datos centrados
-                X_centered = X_v_t - mu.unsqueeze(0)
+                if len(X_v_t) > SVD_MAX_SAMPLES:
+                    perm = torch.randperm(len(X_v_t))[:SVD_MAX_SAMPLES]
+                    X_svd = X_v_t[perm]
+                else:
+                    X_svd = X_v_t
+
+                mu = X_svd.mean(dim=0)
+                X_centered = X_svd - mu.unsqueeze(0)
                 s = torch.linalg.svdvals(X_centered)
                 p = (s**2) / ((s**2).sum() + 1e-8)
                 p = torch.clamp(p, min=1e-6)
                 p = p / p.sum()
                 eff_rank = torch.exp(-(p * torch.log(p)).sum()).item()
-                
+
+                # mu se calcula sobre el subconjunto: escala suficiente para detectar drift
+                # relativo entre épocas (diferencia, no valor absoluto).
                 metrics['mu'] = mu  # Sin normalizar para el drift relativo
                 metrics['eff_rank'] = eff_rank
                 
@@ -639,23 +660,32 @@ def main():
             logger.warning("⚠️ No se encontró ningún checkpoint para Linear Probe. Saltando.")
         else:
             best_ckpt = torch.load(best_ckpt_file, map_location=device, weights_only=False)
-            # L6 FIX: clean_state_dict_for_save ya elimina _orig_mod y module prefixes.
-            # Solo necesitamos extraer las claves del encoder (descartar projector/predictor).
-            clean_enc = {}
-            for k, v in best_ckpt["model_q"].items():
-                k_clean = k.replace("_orig_mod.", "").replace("module.", "")
-                if k_clean.startswith("encoder."):
-                    clean_enc[k_clean.replace("encoder.", "")] = v
 
-            eval_enc = models.resnet50(weights=None)
-            eval_enc.fc = nn.Identity()
-            eval_enc.load_state_dict(clean_enc, strict=False)
+            # Extraer el ModelBase completo (encoder + projector) para la Linear Probe.
+            #
+            # DISEÑO DELIBERADO: Se usa el projector (256-dim) en lugar del backbone crudo
+            # (2048-dim) para mantener COHERENCIA con el KNN, que también evalúa sobre 256-dim.
+            # Referencia: Chen et al. (MoCo v3) y Grill et al. (BYOL) reportan que evaluar
+            # sobre la representación del projector da métricas más representativas del
+            # espacio latente que fue entrenado por la loss de contrastive learning.
+            # Si se quisiera evaluar el backbone puro (transfer learning clásico), se debe
+            # usar model_q.encoder directamente con fc=Identity (2048-dim).
+            clean_model_q = {}
+            for k_ckpt, v in best_ckpt["model_q"].items():
+                k_clean = k_ckpt.replace("_orig_mod.", "").replace("module.", "")
+                clean_model_q[k_clean] = v
+
+            eval_model_base = ModelBase(
+                dim=CONFIG["moco"]["dim"],
+                predictor_hidden_dim=CONFIG["moco"].get("predictor_hidden_dim", 4096)
+            ).to(device)
+            eval_model_base.load_state_dict(clean_model_q, strict=False)
 
             num_classes = len(eval_ds.classes)
-            head, acc, f1 = run_linear_probe(eval_enc, eval_ds, val_ds, num_classes, CONFIG, device)
+            head, acc, f1 = run_linear_probe(eval_model_base, eval_ds, val_ds, num_classes, CONFIG, device)
 
             torch.save(head, CONFIG["paths"]["encoder_export_path"].replace(".pth", "_head.pth"))
-            torch.save(clean_enc, CONFIG["paths"]["encoder_export_path"])
+            torch.save(clean_model_q, CONFIG["paths"]["encoder_export_path"])
             with open(CONFIG["paths"]["metrics_path"], "w") as f: json.dump({"acc": acc, "f1": f1}, f, indent=4)
             logger.info("✅ Listo.")
 

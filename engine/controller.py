@@ -3,10 +3,42 @@ import logging
 import torch
 from enum import IntEnum
 
+
 class Action(IntEnum):
     CONTINUE = 0
     EARLY_STOP = 1
     ROLLBACK = 2
+
+
+def deadband(x: float, threshold: float = 0.1) -> float:
+    """Zona muerta: suprime señales de control pequeñas para evitar chattering."""
+    return 0.0 if abs(x) < threshold else x
+
+
+def _buffer_entry_to_serializable(entry: dict) -> dict:
+    """Convierte una entrada del eval_buffer a tipos serializables (sin tensores GPU).
+    
+    Crítico para la portabilidad del checkpoint: un tensor en GPU no puede ser
+    cargado directamente en un entorno CPU-only (ej. análisis offline, CI).
+    """
+    out = {}
+    for k, v in entry.items():
+        if isinstance(v, torch.Tensor):
+            out[k] = {'__tensor__': True, 'data': v.detach().cpu().tolist()}
+        else:
+            out[k] = v
+    return out
+
+
+def _buffer_entry_from_serializable(entry: dict) -> dict:
+    """Restaura una entrada del eval_buffer desde su forma serializable."""
+    out = {}
+    for k, v in entry.items():
+        if isinstance(v, dict) and v.get('__tensor__'):
+            out[k] = torch.tensor(v['data'])
+        else:
+            out[k] = v
+    return out
 
 class EMA:
     def __init__(self, beta=0.9):
@@ -75,12 +107,27 @@ class TrainingController:
         self.is_best_geom = False
         self.eval_buffer = []
         self.max_pos_sim = 0.0
-        
-        # Historial
+
+        # Historial acotado: se conservan las últimas HISTORY_MAX_LEN épocas.
+        # Esto evita crecimiento lineal del checkpoint en runs largos de Kaggle
+        # (ej. 500 épocas × 7 listas × 8 bytes = 28 KB sin cap; con cap: constante).
+        self.HISTORY_MAX_LEN: int = 300
         self.history = {
-            'loss': [], 'knn_acc': [], 'unif': [], 'align': [], 
+            'loss': [], 'knn_acc': [], 'unif': [], 'align': [],
             'pos_sim': [], 'neg_sim': [], 'ratio_norm': []
         }
+
+    def _trim_history(self) -> None:
+        """Recorta el historial si supera HISTORY_MAX_LEN para acotar el tamaño del checkpoint.
+
+        Cuando cualquier lista supera el límite, se truncan TODAS a la mitad del cap
+        para amortizar el costo del recorte (O(n) slicing) en lugar de hacerlo cada época.
+        De este modo, trim ocurre solo cada HISTORY_MAX_LEN // 2 épocas.
+        """
+        if any(len(v) > self.HISTORY_MAX_LEN for v in self.history.values()):
+            keep = self.HISTORY_MAX_LEN // 2
+            for key in self.history:
+                self.history[key] = self.history[key][-keep:]
 
     def get_dynamic_hyperparams(self, step, total_steps, metrics=None):
         # Auto-Tuner Geométrico (PID Latente):
@@ -99,7 +146,9 @@ class TrainingController:
         self.history['align'].append(metrics['align'])
         self.history['pos_sim'].append(metrics['pos_sim'])
         self.history['neg_sim'].append(metrics['neg_sim'])
-        if curr_acc >= 0: self.history['knn_acc'].append(curr_acc)
+        if curr_acc >= 0:
+            self.history['knn_acc'].append(curr_acc)
+        self._trim_history()  # Evita crecimiento ilimitado del checkpoint
 
         is_warmup = (epoch < self.config["training"]["warmup_epochs"]) and not self.warmup_aborted
         is_exploitation = self.config.get("training", {}).get("exploitation_mode", False)
@@ -212,9 +261,7 @@ class TrainingController:
                     self.eR_ema = 0.85 * self.eR_ema + 0.15 * corrected_eR
                     
                     # Deadband (Zona Muerta) APLICADA DESPUÉS DEL EMA para evitar sesgos nulos
-                    def deadband(x, threshold=0.1):
-                        return 0.0 if abs(x) < threshold else x
-                    
+                    # (función definida a nivel de módulo para testabilidad y eficiencia)
                     eU_ctrl = deadband(self.eU_ema, 0.1)
                     eD_ctrl = deadband(self.eD_ema, 0.1)
                     eR_ctrl = deadband(self.eR_ema, 0.05)
@@ -246,8 +293,10 @@ class TrainingController:
                     old_scale = self.lr_scale
                     
                     # REFLEJO ESPINAL: Control reactivo bypass de emergencia
-                    # Umbral adaptativo: Mezcla señal rápida y lenta para no reaccionar tarde
-                    adaptive_threshold = max(0.7, 0.5 * self.eR_ema + 0.5 * delta_rank_abs)
+                    # Umbral adaptativo: Mayor peso al histórico (eR_ema) que al spike instantáneo.
+                    # Pesos 0.7/0.3: evita que un eR_ema alto por crisis previas eleve tanto el
+                    # umbral que el reflejo quede silenciado ante un spike real (retroalimentación positiva).
+                    adaptive_threshold = max(0.7, 0.7 * self.eR_ema + 0.3 * delta_rank_abs)
                     
                     if delta_rank_abs > adaptive_threshold:
                         self.crisis_counter += 1
@@ -285,12 +334,15 @@ class TrainingController:
                             self.I_U *= 0.9 # Leak cuando está saturado
                         self.tau = max(min(self.tau, 0.25), 0.05)
                         
-                    # CONTROL CONTINUO: PID latente estándar
+                    # CONTROL CONTINUO: PID latente estándar sobre el rank de varianza.
+                    # Asimetría INTENCIONAL: la penalización (riesgo inminente) es 10x más
+                    # agresiva que la recuperación (salida del colapso). Esto implementa
+                    # el principio de 'primero no hagas daño': se frena rápido, se libera despacio.
                     if eR_ctrl > 0:
-                        # Penalización fuerte y rápida (riesgo inminente)
+                        # Penalización fuerte y rápida (riesgo inminente de colapso)
                         self.lr_scale *= math.exp(-Kp_lr * eR_ctrl)
                     else:
-                        # Recuperación lenta y controlada (salida del colapso)
+                        # Recuperación lenta y controlada (salida del colapso, 10x más lenta)
                         self.lr_scale *= math.exp(-0.1 * Kp_lr * eR_ctrl)
                         
                     self.lr_scale = max(min(self.lr_scale, 1.0), 0.1)
@@ -360,29 +412,50 @@ class TrainingController:
 
         return Action.CONTINUE
 
-    def state_dict(self):
+    def state_dict(self) -> dict:
+        """Serializa el estado completo del controlador a tipos Python nativos.
+        
+        Invariantes de seguridad:
+          - Todos los torch.Tensor en eval_buffer y prev_mu se convierten a listas
+            para garantizar portabilidad CPU/GPU y compatibilidad con weights_only=True.
+          - Nuevos campos añadidos aquí DEBEN tener un .get() con default en load_state_dict
+            para mantener retrocompatibilidad con checkpoints anteriores.
+        """
+        # Serializar prev_mu de forma segura (puede ser tensor o None)
+        prev_mu_safe = None
+        if self.prev_mu is not None:
+            if isinstance(self.prev_mu, torch.Tensor):
+                prev_mu_safe = {'__tensor__': True, 'data': self.prev_mu.detach().cpu().tolist()}
+            else:
+                prev_mu_safe = self.prev_mu  # Ya es lista (checkpoint viejo)
+
         return {
-            'best_acc': self.best_acc, 
-            'patience': self.patience, 
+            # --- Estado de entrenamiento ---
+            'best_acc': self.best_acc,
+            'patience': self.patience,
+            'warmup_aborted': self.warmup_aborted,   # FIX #3: persiste post-resume
             'temp_adj': self.temp_adj,
             'history': self.history,
+            # --- Observadores EMA ---
             'ema_unif': self.ema_unif.value,
             'ema_align': self.ema_align.value,
             'ema_pos_sim': self.ema_pos_sim.value,
             'ema_neg_sim': self.ema_neg_sim.value,
             'ema_ratio_baseline': self.ema_ratio_baseline.value,
             'last_ratio_ema': self.last_ratio_ema,
+            # --- Detector de saturación geométrica ---
             'sat_patience': self.sat_patience,
             'sat_ema': self.sat_ema,
-            'prev_mu': self.prev_mu,
+            'prev_mu': prev_mu_safe,                  # FIX #1: tensor → lista serializable
             'prev_eff_rank': self.prev_eff_rank,
             'prev_pos_sim': self.prev_pos_sim,
             'prev_neg_sim': self.prev_neg_sim,
             'prev_delta_pos': self.prev_delta_pos,
             'prev_delta_neg': self.prev_delta_neg,
             'best_geom_score': self.best_geom_score,
-            'eval_buffer': self.eval_buffer,
+            'eval_buffer': [_buffer_entry_to_serializable(e) for e in self.eval_buffer],  # FIX #1
             'max_pos_sim': self.max_pos_sim,
+            # --- Estado del controlador PID ---
             'tau': self.tau,
             'alpha': self.alpha,
             'current_m': self.current_m,
@@ -395,52 +468,81 @@ class TrainingController:
             'steps': self.steps,
             'tau_rank_coef': self.tau_rank_coef,
             'prev_tau': self.prev_tau,
-            'crisis_counter': getattr(self, 'crisis_counter', 0)
+            'crisis_counter': self.crisis_counter,
         }
 
-    def load_state_dict(self, state):
+    def load_state_dict(self, state: dict) -> None:
+        """Restaura el estado completo del controlador desde un checkpoint.
+        
+        Retrocompatibilidad: todos los campos usan .get() con valores por defecto
+        para que checkpoints de versiones anteriores carguen sin errores.
+        """
+        # --- Estado de entrenamiento ---
         self.best_acc = state.get('best_acc', 0.0)
         self.patience = state.get('patience', 0)
+        self.warmup_aborted = state.get('warmup_aborted', False)  # FIX #3
         self.temp_adj = state.get('temp_adj', 0.0)
         if 'history' in state:
             for k, v in state['history'].items():
-                if k in self.history: self.history[k] = v
-        
+                if k in self.history:
+                    self.history[k] = v
+
+        # --- Observadores EMA ---
         self.ema_unif.value = state.get('ema_unif')
         self.ema_align.value = state.get('ema_align')
         self.ema_pos_sim.value = state.get('ema_pos_sim')
         self.ema_neg_sim.value = state.get('ema_neg_sim')
         self.ema_ratio_baseline.value = state.get('ema_ratio_baseline')
         self.last_ratio_ema = state.get('last_ratio_ema')
+
+        # --- Detector de saturación geométrica ---
         self.sat_patience = state.get('sat_patience', 0)
         self.sat_ema = state.get('sat_ema', None)
-        self.prev_mu = state.get('prev_mu', None)
+
+        # FIX #1: Restaurar prev_mu soportando formato nuevo (dict serializado)
+        # y formato legado (tensor directo o None) para retrocompatibilidad.
+        raw_mu = state.get('prev_mu', None)
+        if raw_mu is None:
+            self.prev_mu = None
+        elif isinstance(raw_mu, dict) and raw_mu.get('__tensor__'):
+            self.prev_mu = torch.tensor(raw_mu['data'])
+        elif isinstance(raw_mu, torch.Tensor):
+            self.prev_mu = raw_mu  # Checkpoint legado con tensor directo
+        else:
+            self.prev_mu = raw_mu  # Lista plana u otro tipo legado
+
         self.prev_eff_rank = state.get('prev_eff_rank', None)
         self.prev_pos_sim = state.get('prev_pos_sim', None)
         self.prev_neg_sim = state.get('prev_neg_sim', None)
         self.prev_delta_pos = state.get('prev_delta_pos', 0.0)
         self.prev_delta_neg = state.get('prev_delta_neg', 0.0)
         self.best_geom_score = state.get('best_geom_score', float('inf'))
-        self.eval_buffer = state.get('eval_buffer', [])
         self.max_pos_sim = state.get('max_pos_sim', 0.0)
-        
+
+        # FIX #1: Restaurar eval_buffer soportando formato nuevo y legado.
+        raw_buffer = state.get('eval_buffer', [])
+        self.eval_buffer = [
+            _buffer_entry_from_serializable(e) if isinstance(e, dict) else e
+            for e in raw_buffer
+        ]
+
+        # --- Estado del controlador PID ---
         self.tau = state.get('tau', self.tau)
         self.alpha = state.get('alpha', self.alpha)
         self.current_m = state.get('current_m', self.current_m)
         self.lr_scale = state.get('lr_scale', self.lr_scale)
         self.lr_step_factor = state.get('lr_step_factor', 1.0)
-        
         self.eU_ema = state.get('eU_ema', 0.0)
         self.eD_ema = state.get('eD_ema', 0.0)
         self.eR_ema = state.get('eR_ema', 0.0)
         self.I_U = state.get('I_U', 0.0)
         self.steps = state.get('steps', 0)
-        
         self.tau_rank_coef = state.get('tau_rank_coef', 0.5)
         self.prev_tau = state.get('prev_tau', self.tau)
         self.crisis_counter = state.get('crisis_counter', 0)
-        
-        # Evitar decisiones agresivas post-resume (Cold start penalty)
+
+        # Cold-start penalty: atenúa señales de error post-resume para evitar
+        # que el controlador tome decisiones agresivas con estado EMA desactualizado.
         warmup_factor = min(1.0, self.steps / 100.0) if self.steps > 0 else 1.0
         self.eU_ema *= warmup_factor
         self.eD_ema *= warmup_factor

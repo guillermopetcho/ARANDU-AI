@@ -195,12 +195,14 @@ class MoCoTrainer:
             grad_steps = int(grad_steps)
             num_steps = max(1, int(valid_steps / dist.get_world_size()))  # Promedio de valid_steps
 
-        # I1 FIX: Monitorear integridad del dataset
+        # I1 FIX: Monitorear integridad del dataset.
+        # Se lee desde _load_errors.Value (compartido entre workers via multiprocessing)
+        # en lugar del atributo de instancia clásico, que sería invisible entre procesos forkeados.
         load_errors = 0
-        if hasattr(loader.dataset, 'load_errors'):
-            load_errors = loader.dataset.load_errors
-            # Reset para la siguiente época
-            loader.dataset.load_errors = 0
+        if hasattr(loader.dataset, '_load_errors'):
+            with loader.dataset._load_errors.get_lock():
+                load_errors = loader.dataset._load_errors.value
+                loader.dataset._load_errors.value = 0  # Reset atómico para la siguiente época
         
         error_rate = (load_errors / max(1, len(loader) * self.config['training']['batch_size'])) * 100
         if error_rate > 1.0 and rank == 0:

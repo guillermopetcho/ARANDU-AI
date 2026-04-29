@@ -1,4 +1,6 @@
 import os
+import multiprocessing
+import multiprocessing.context
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,8 +12,60 @@ import random
 import numpy as np
 from pathlib import Path
 import logging
+import threading
 
 from utils.distributed import concat_all_gather
+
+
+# ---------------------------------------------------------------------------
+# Contador de errores de carga compartido entre procesos worker
+# ---------------------------------------------------------------------------
+
+class _ThreadSafeFallbackCounter:
+    """Contador thread-safe basado en threading.Lock como fallback.
+
+    Se usa cuando multiprocessing.Value no está disponible o no es compatible
+    con el contexto de spawn (macOS, Windows). En ese caso, los errores de
+    workers forkeados no son visibles, pero la clase no crashea.
+    """
+    def __init__(self):
+        self.value = 0
+        self._lock = threading.Lock()
+
+    def get_lock(self):
+        return self._lock
+
+
+def _make_shared_counter():
+    """Crea un contador entero compartido entre procesos, compatible con el
+    contexto de multiprocessing que usa el DataLoader de PyTorch.
+
+    En Linux (fork): usa multiprocessing.Value directamente. Los workers
+    forkeados heredan la memoria compartida y las actualizaciones son visibles.
+
+    En macOS/Windows (spawn): multiprocessing.Value también funciona porque
+    los objetos compartidos usan memoria de sistema (mmap) en lugar de heredar
+    el espacio de proceso. Se detecta el contexto real y se crea el Value conél.
+
+    Fallback: si algo falla inesperadamente, retorna un contador thread-safe
+    local (no compartido entre procesos) con un warning.
+    """
+    logger = logging.getLogger("AranduSSL")
+    try:
+        # Detectar el contexto real que usará PyTorch.
+        # torch.multiprocessing.get_start_method() puede ser 'fork', 'forkserver' o 'spawn'.
+        import torch.multiprocessing as tmp
+        start_method = tmp.get_start_method(allow_none=True) or 'fork'
+        ctx = multiprocessing.get_context(start_method)
+        counter = ctx.Value('i', 0)
+        logger.debug(f"MoCoDataset: contador de errores usando mp.Value (ctx={start_method})")
+        return counter
+    except Exception as e:
+        logger.warning(
+            f"MoCoDataset: no se pudo crear mp.Value compartido ({e}). "
+            "El contador de errores de carga será local a cada proceso (monitoreo aproximado)."
+        )
+        return _ThreadSafeFallbackCounter()
 
 # Eliminado RandomRotate90 para evitar transformaciones físicamente imposibles en cultivos.
 
@@ -81,7 +135,10 @@ class MoCoDataset(Dataset):
             scale_min, scale_max, size = 0.05, 0.4, 96
         
         self.local_transforms = get_local_transforms(n_local, (scale_min, scale_max), size) if n_local > 0 else []
-        self.load_errors = 0
+        # Contador de errores de carga compartido entre workers.
+        # Usa _make_shared_counter() para ser compatible con fork, spawn y forkserver,
+        # detectando automáticamente el contexto de multiprocessing de PyTorch.
+        self._load_errors = _make_shared_counter()
         self.logger = logging.getLogger("AranduSSL")
 
     def __len__(self):
@@ -107,8 +164,9 @@ class MoCoDataset(Dataset):
                 return v_q, v_k, locals_
             except Exception as e:
                 last_err = e
-                # B12 FIX: Contabilizar errores de carga para monitoreo
-                self.load_errors += 1
+                # B12 FIX: Incrementar contador de errores de carga (visible entre workers)
+                with self._load_errors.get_lock():
+                    self._load_errors.value += 1
                 if len(self.paths) == 0:
                     raise RuntimeError("MoCoDataset está vacío, no hay imágenes disponibles.")
                 idx = random.randint(0, len(self.paths) - 1)
