@@ -1,5 +1,6 @@
 import math
 import logging
+import collections
 import torch
 from enum import IntEnum
 
@@ -41,14 +42,23 @@ def _buffer_entry_from_serializable(entry: dict) -> dict:
     return out
 
 class EMA:
-    def __init__(self, beta=0.9):
+    """Exponential Moving Average (media móvil exponencial).
+
+    `update(x)` retorna el nuevo valor de la EMA después de incorporar `x`.
+    Si `x is None`, la EMA se mantiene sin cambios (comportamiento pass-through).
+    Esto permite pasar valores opcionales sin condiciones extra en el caller.
+    Si el primer `x` es None, `value` sigue siendo None hasta que se reciba
+    un valor real (inicialización diferida).
+    """
+    def __init__(self, beta: float = 0.9):
         self.beta = beta
         self.value = None
 
     def update(self, x):
-        if x is None: return self.value
+        if x is None:
+            return self.value  # Pass-through: no actualiza si el input es nulo
         if self.value is None:
-            self.value = x
+            self.value = x     # Inicialización diferida: primer valor real
         else:
             self.value = self.beta * self.value + (1 - self.beta) * x
         return self.value
@@ -105,7 +115,9 @@ class TrainingController:
         self.prev_delta_neg = 0.0
         self.best_geom_score = float('inf')
         self.is_best_geom = False
-        self.eval_buffer = []
+        # deque(maxlen=3): FIFO automático sin pop(0) explícito (O(1) vs O(n)).
+        # El maxlen garantiza que nunca excede 3 entradas sin gestión manual.
+        self.eval_buffer: collections.deque = collections.deque(maxlen=3)
         self.max_pos_sim = 0.0
 
         # Historial acotado: se conservan las últimas HISTORY_MAX_LEN épocas.
@@ -189,8 +201,8 @@ class TrainingController:
                 'eff_rank': metrics['eff_rank'],
                 'mu': metrics['mu']
             })
-            if len(self.eval_buffer) > 3:
-                self.eval_buffer.pop(0)
+            # deque(maxlen=3) descarta automáticamente la entrada más antigua
+            # cuando se supera el límite. No se necesita pop(0) explícito.
 
             if len(self.eval_buffer) == 3:
                 avg_pos = sum(x['pos_sim'] for x in self.eval_buffer) / 3.0
@@ -453,6 +465,8 @@ class TrainingController:
             'prev_delta_pos': self.prev_delta_pos,
             'prev_delta_neg': self.prev_delta_neg,
             'best_geom_score': self.best_geom_score,
+            # deque se serializa como lista: los tipos nativos de Python son
+            # compatibles con pickle (torch.save) y con weights_only=True.
             'eval_buffer': [_buffer_entry_to_serializable(e) for e in self.eval_buffer],  # FIX #1
             'max_pos_sim': self.max_pos_sim,
             # --- Estado del controlador PID ---
@@ -520,11 +534,14 @@ class TrainingController:
         self.max_pos_sim = state.get('max_pos_sim', 0.0)
 
         # FIX #1: Restaurar eval_buffer soportando formato nuevo y legado.
+        # Se reconstruye siempre como deque(maxlen=3) independientemente de
+        # cómo estaba guardado (lista plana, lista de dicts serializados).
         raw_buffer = state.get('eval_buffer', [])
-        self.eval_buffer = [
-            _buffer_entry_from_serializable(e) if isinstance(e, dict) else e
-            for e in raw_buffer
-        ]
+        self.eval_buffer = collections.deque(
+            (_buffer_entry_from_serializable(e) if isinstance(e, dict) else e
+             for e in raw_buffer),
+            maxlen=3
+        )
 
         # --- Estado del controlador PID ---
         self.tau = state.get('tau', self.tau)

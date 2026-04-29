@@ -99,13 +99,16 @@ def _faiss_search(
         active_index.add(X_train_norm)
         _, indices = active_index.search(X_val_norm, k)
     except Exception as search_err:
-        # Si la búsqueda en GPU falló, intentar en CPU antes de rendirse
+        # Si la búsqueda en GPU falló, intentar en CPU antes de rendirse.
+        # NOTA: cpu_index siempre está vacío aquí porque solo `active_index`
+        # (que era el índice GPU) recibió el .add(). El cpu_index original
+        # nunca fue populado, así que el .add() de abajo no es un "doble add".
         if active_index is not cpu_index:
             _logger.warning(
                 f"FAISS GPU search falló ({search_err}). Reintentando en CPU..."
             )
             try:
-                cpu_index.add(X_train_norm)
+                cpu_index.add(X_train_norm)  # cpu_index estaba vacío — primer y único add
                 _, indices = cpu_index.search(X_val_norm, k)
             except Exception as cpu_err:
                 raise RuntimeError(

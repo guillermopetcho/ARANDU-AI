@@ -1,4 +1,5 @@
 import math
+import collections
 
 import torch
 import torch.nn.functional as F
@@ -115,33 +116,55 @@ def get_module_stats(module: torch.nn.Module) -> dict:
     """Estadísticas agregadas de los parámetros de un módulo.
 
     Calcula media, std y norma tanto por capa como globales.
-    Usa estadísticas online (Welford) para las globales en lugar de concatenar
-    todos los parámetros en un tensor masivo (O(1) memoria en lugar de O(P)).
+    Usa el algoritmo de Welford para lotes (Chan et al., 1979) para las
+    estadísticas globales: O(1) memoria extra en lugar de concatenar todo
+    el módulo (potencialmente 25M+ floats) en un tensor temporal.
+
+    Referencia: Chan, Golub & LeVeque (1979). "Updating formulae and a
+    pairwise algorithm for computing sample variances."
     """
     stats = {}
     with torch.no_grad():
-        # Estadísticas globales via Welford online (sin concatenar)
+        # Acumuladores para estadísticas globales (Welford por lotes)
         total_count = 0
-        total_mean = 0.0
-        total_M2 = 0.0    # Suma de diferencias al cuadrado (para varianza)
-        total_sum_sq = 0.0  # Para la norma L2
+        total_mean  = 0.0
+        total_M2    = 0.0   # Suma de cuadrados de desviaciones (para varianza)
+        total_sum_sq = 0.0  # Para la norma L2 global
 
         for name, param in module.named_parameters():
             p_data = param.data.float().view(-1)
             n = p_data.numel()
 
+            # Estadísticas por capa
             if n > 1:
                 stats[f"{name}_std"]  = p_data.std().item()
             stats[f"{name}_mean"] = p_data.mean().item()
 
-            # Actualización de Welford para media y varianza globales
-            # Referencia: Knuth, TAOCP Vol. 2 §4.2.2
-            for x in [p_data.mean().item()]:  # actualizar con la media del tensor
-                total_count += n
-                delta = p_data.sum().item() - total_mean * n
-                total_mean += delta / total_count
-                total_M2 += p_data.var(unbiased=False).item() * n
+            # ---------------------------------------------------------------------------
+            # Actualización de Welford por lotes (batch update)
+            #
+            # Para combinar la población actual (total_count, total_mean, total_M2)
+            # con la nueva población (n, param_mean, param_M2):
+            #   delta    = mean_B - mean_A
+            #   n_total  = n_A + n_B
+            #   new_mean = (n_A * mean_A + n_B * mean_B) / n_total
+            #   new_M2   = M2_A + M2_B + delta² * n_A * n_B / n_total
+            #
+            # Esto es exacto y numéricamente estable (sin overflow por concatenación).
+            # ---------------------------------------------------------------------------
+            param_mean = p_data.mean().item()
+            param_M2   = p_data.var(unbiased=False).item() * n  # sum of sq. deviations
 
+            if total_count == 0:
+                total_mean = param_mean
+                total_M2   = param_M2
+            else:
+                delta       = param_mean - total_mean
+                n_total     = total_count + n
+                total_mean  = (total_count * total_mean + n * param_mean) / n_total
+                total_M2   += param_M2 + delta ** 2 * total_count * n / n_total
+
+            total_count  += n
             total_sum_sq += p_data.pow(2).sum().item()
 
         if total_count > 0:
