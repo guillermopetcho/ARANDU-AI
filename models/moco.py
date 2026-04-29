@@ -90,6 +90,7 @@ class MoCoDataset(Dataset):
     def __getitem__(self, idx):
         # M4 FIX: Límite de reintentos para evitar loop infinito si muchas imágenes son corruptas
         max_retries = min(100, len(self.paths))
+        last_err = None
         for attempt in range(max_retries):
             try:
                 img = Image.open(self.paths[idx]).convert("RGB")
@@ -105,12 +106,13 @@ class MoCoDataset(Dataset):
                 
                 return v_q, v_k, locals_
             except Exception as e:
+                last_err = e
                 # B12 FIX: Contabilizar errores de carga para monitoreo
                 self.load_errors += 1
                 if len(self.paths) == 0:
                     raise RuntimeError("MoCoDataset está vacío, no hay imágenes disponibles.")
                 idx = random.randint(0, len(self.paths) - 1)
-        raise RuntimeError(f"MoCoDataset: {max_retries} imágenes consecutivas fallaron al cargarse. Último error: {e}")
+        raise RuntimeError(f"MoCoDataset: {max_retries} imágenes consecutivas fallaron al cargarse. Último error: {last_err}")
 
 def build_index(root, rank, cache_path):
     """Construye o carga el índice de imágenes del dataset con sincronización DDP.
