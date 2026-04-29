@@ -125,8 +125,20 @@ def build_index(root, rank, cache_path):
     
     # 1. Rank 0 verifica y construye si es necesario
     if rank == 0:
-        if not os.path.exists(cache_path):
-            files = sorted([str(f) for ext in ["*.jpg", "*.png", "*.jpeg"] for f in Path(root).rglob(ext)])
+        rebuild = True
+        if os.path.exists(cache_path):
+            try:
+                # Validar que el caché no esté corrupto o desactualizado (paths absolutos de Kaggle cambian)
+                cached_files = np.load(cache_path, allow_pickle=True).tolist()
+                if len(cached_files) > 0 and cached_files[0].startswith(root) and os.path.exists(cached_files[0]):
+                    rebuild = False
+                else:
+                    logging.getLogger("AranduSSL").warning("⚠️ Caché obsoleto o inválido detectado. Reconstruyendo índice...")
+            except Exception:
+                pass
+                
+        if rebuild:
+            files = sorted([str(f) for ext in ["*.jpg", "*.png", "*.jpeg", "*.JPG", "*.PNG"] for f in Path(root).rglob(ext)])
             if len(files) == 0:
                 raise RuntimeError(f"No se encontraron imágenes en {root}")
             np.save(cache_path, files)
