@@ -11,6 +11,8 @@ except ImportError:
     from sklearn.neighbors import KNeighborsClassifier
     HAS_FAISS = False
 
+from sklearn.metrics import accuracy_score
+
 _logger = logging.getLogger("AranduSSL")
 
 # ---------------------------------------------------------------------------
