@@ -94,7 +94,11 @@ class TrainingController:
         self.tau_rank_coef = 0.5
         self.prev_tau = self.tau
         
-        self.crisis_counter = 0 # Contador de shocks consecutivos
+        self.crisis_counter = 0  # Contador de shocks consecutivos
+        # Cuenta cuántas veces el GeoSat tuvo datos suficientes para actuar (eval_buffer lleno).
+        # Las primeras N activaciones tienen drift artificialmente alto porque mu se está
+        # moviendo desde la inicialización aleatoria — se suprimen las acciones hasta estabilizar.
+        self.geosat_activations = 0
         
         # Observadores Suavizados (EMA)
         self.ema_unif = EMA(beta=0.9)
@@ -150,8 +154,10 @@ class TrainingController:
         
         u_ema = self.ema_unif.update(metrics['unif'])
         a_ema = self.ema_align.update(metrics['align'])
-        ps_ema = self.ema_pos_sim.update(metrics['pos_sim'])
-        ns_ema = self.ema_neg_sim.update(metrics['neg_sim'])
+        # Actualizar EMAs de pos/neg sim (efecto secundario persiste en self.ema_pos_sim.value
+        # y se serializa en state_dict). Las variables locales no se usan en este método.
+        self.ema_pos_sim.update(metrics['pos_sim'])
+        self.ema_neg_sim.update(metrics['neg_sim'])
         
         self.history['loss'].append(metrics['loss'])
         self.history['unif'].append(metrics['unif'])
@@ -205,13 +211,19 @@ class TrainingController:
             # cuando se supera el límite. No se necesita pop(0) explícito.
 
             if len(self.eval_buffer) == 3:
-                avg_pos = sum(x['pos_sim'] for x in self.eval_buffer) / 3.0
-                avg_neg = sum(x['neg_sim'] for x in self.eval_buffer) / 3.0
+                avg_pos  = sum(x['pos_sim']  for x in self.eval_buffer) / 3.0
+                avg_neg  = sum(x['neg_sim']  for x in self.eval_buffer) / 3.0
                 avg_rank = sum(x['eff_rank'] for x in self.eval_buffer) / 3.0
-                avg_mu = sum(x['mu'] for x in self.eval_buffer) / 3.0
-                
+                # Error 1 fix: sum() Python inicia con 0 (int), lo que falla en multi-GPU
+                # cuando el primer tensor no está en el mismo device que 0.
+                # torch.stack().mean() es el idiom correcto para promediar tensores.
+                avg_mu = torch.stack([x['mu'] for x in self.eval_buffer]).mean(dim=0)
+
+                # Error 3 fix: incrementar aquí, FUERA del bloque `if self.prev_mu is not None`,
+                # para contar correctamente la primera activación (cuando prev_mu aún es None).
+                self.geosat_activations += 1
                 self.max_pos_sim = max(self.max_pos_sim, avg_pos)
-                
+
                 if self.prev_mu is not None:
                     # 1. Drift relativo
                     drift = torch.norm(avg_mu - self.prev_mu).item() / (torch.norm(self.prev_mu).item() + 1e-8)
@@ -308,7 +320,12 @@ class TrainingController:
                     # Umbral adaptativo: Mayor peso al histórico (eR_ema) que al spike instantáneo.
                     # Pesos 0.7/0.3: evita que un eR_ema alto por crisis previas eleve tanto el
                     # umbral que el reflejo quede silenciado ante un spike real (retroalimentación positiva).
-                    adaptive_threshold = max(0.7, 0.7 * self.eR_ema + 0.3 * delta_rank_abs)
+                    # Error 4 fix: eR_ema es un error normalizado (puede ser negativo),
+                    # mientras que delta_rank_abs es siempre >= 0. Mezclarlos sin abs()
+                    # produce un threshold que disminuye cuando el controlador está bajo
+                    # presión negativa, silenciando el reflejo de emergencia justo cuando
+                    # más se necesita. abs() restaura la coherencia de unidades.
+                    adaptive_threshold = max(0.7, 0.7 * abs(self.eR_ema) + 0.3 * delta_rank_abs)
                     
                     if delta_rank_abs > adaptive_threshold:
                         self.crisis_counter += 1
@@ -364,13 +381,31 @@ class TrainingController:
                     # ----------------------------------------------------------
                     
                     # 4. Señal explícita de degradación con ancla empírica (KNN patience)
-                    unif_val = self.history['unif'][-1] if self.history['unif'] else 0.0
+                    # Error 2 fix: unif_val ya fue calculado en la línea 247 del bloque PID.
+                    # Se elimina el cálculo duplicado para evitar inconsistencias futuras
+                    # si alguno de los dos se modifica sin actualizar el otro.
+                    # Error 3 fix: geosat_activations ya se incrementó arriba (fuera del
+                    # bloque prev_mu). Se elimina el incremento redundante de aquí.
+
+                    # A. Degradación Extrema: Rango explotando o colapso de la distribución.
+                    #
+                    # SEMÁNTICA DE UNIFORMIDAD (crítico para no invertir la lógica):
+                    #   - Uniformidad MÁS negativa = distribución MÁS uniforme = MEJOR.
+                    #   - U ≈ 0   → COLAPSO (todos los embeddings en el mismo punto).
+                    #   - U = -2.4 → Excelente distribución esférica (NO es degradación).
+                    # Por tanto, el umbral de colapso es unif_val > -0.3 (cerca de cero),
+                    # NO unif_val < -2.2 (que detectaría exactamente lo contrario: éxito).
+                    #
+                    # Guard de fase inicial: las primeras 2 activaciones del GeoSat tienen
+                    # drift alto porque mu se mueve desde la inicialización aleatoria.
+                    # No actuamos hasta tener al menos 3 activaciones con datos estables.
+                    _geosat_mature = self.geosat_activations >= 3
                     
-                    # A. Degradación Extrema: Rango explotando o repulsión masiva.
-                    # No esperamos 2 épocas (ahorramos 50 min de Kaggle) si la inestabilidad es obvia.
-                    if delta_rank_abs > 0.6 or unif_val < -2.2:
+                    if delta_rank_abs > 0.6 or unif_val > -0.3:
                         self.logger.warning(f"⚠️ DEGRADACIÓN SEVERA DETECTADA: ΔRank={delta_rank_abs:.4f}, U={unif_val:.2f}")
-                        if self.patience >= 1:
+                        if not _geosat_mature:
+                            self.logger.warning(f"   ↳ GeoSat en fase inicial (activación {self.geosat_activations}/3). Suprimiendo acción preventiva.")
+                        elif self.patience >= 1:
                             # Condicionamos el Rollback: Solo se hace Rollback preventivo 
                             # si el optimizador ya frenó y el manifold no se arregló tras varios shocks
                             if self.lr_scale < 0.3 and self.crisis_counter >= 2:
@@ -398,7 +433,11 @@ class TrainingController:
                     else:
                         self.sat_ema = 0.9 * self.sat_ema + 0.1 * sat_score
                         
-                    if sat_score < 0.5 * self.sat_ema:
+                    # Error 5 fix: en la segunda activación sat_ema aún tiene memoria del
+                    # valor inicial alto (primera activación), lo que puede generar un falso
+                    # positivo si sat_score mejora drásticamente entre la 1ª y la 2ª activación.
+                    # Se requieren >= 2 activaciones para que la EMA tenga contexto suficiente.
+                    if self.geosat_activations >= 2 and sat_score < 0.5 * self.sat_ema:
                         self.sat_patience += 1
                         self.logger.info(f"🧊 Espacio latente congelándose... (Paciencia Geo {self.sat_patience}/3)")
                     else:
@@ -483,6 +522,7 @@ class TrainingController:
             'tau_rank_coef': self.tau_rank_coef,
             'prev_tau': self.prev_tau,
             'crisis_counter': self.crisis_counter,
+            'geosat_activations': self.geosat_activations,
         }
 
     def load_state_dict(self, state: dict) -> None:
@@ -557,6 +597,9 @@ class TrainingController:
         self.tau_rank_coef = state.get('tau_rank_coef', 0.5)
         self.prev_tau = state.get('prev_tau', self.tau)
         self.crisis_counter = state.get('crisis_counter', 0)
+        # Retrocompat: checkpoints anteriores no tienen este campo; por defecto 0
+        # (el guard se re-activa correctamente durante el resume).
+        self.geosat_activations = state.get('geosat_activations', 0)
 
         # Cold-start penalty: atenúa señales de error post-resume para evitar
         # que el controlador tome decisiones agresivas con estado EMA desactualizado.
