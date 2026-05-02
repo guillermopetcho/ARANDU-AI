@@ -95,6 +95,7 @@ class TrainingController:
         self.prev_tau = self.tau
         
         self.crisis_counter = 0  # Contador de shocks consecutivos
+        self.healthy_streak = 0  # Histéresis para confirmar reorganización sana
         # Cuenta cuántas veces el GeoSat tuvo datos suficientes para actuar (eval_buffer lleno).
         # Las primeras N activaciones tienen drift artificialmente alto porque mu se está
         # moviendo desde la inicialización aleatoria — se suprimen las acciones hasta estabilizar.
@@ -321,27 +322,63 @@ class TrainingController:
                     old_scale = self.lr_scale
                     
                     # Validar externamente si es crisis o refinamiento
-                    # Si KNN mejora o está estable (patience <= 1) y Uniformidad es buena (muy negativa)
-                    is_healthy_reorg = (self.patience <= 1) and (unif_val < -1.5)
+                    # Si KNN mejora o está estable (patience <= 3, caída marginal), y Uniformidad es buena
+                    tol = max(0.002, 0.002 * self.best_acc)
+                    if curr_acc < 0:
+                        knn_ok = True
+                    else:
+                        # Ventana local de 5 epochs para evaluar estabilidad sin depender del récord absoluto
+                        recent_best = max(self.history['knn_acc'][-5:]) if self.history['knn_acc'] else self.best_acc
+                        knn_ok = curr_acc >= (recent_best - tol)
                     
-                    # REFLEJO ESPINAL: Control reactivo bypass de emergencia
-                    # Umbral adaptativo: Mayor peso al histórico (eR_ema) que al spike instantáneo.
-                    adaptive_threshold = max(0.7, 0.7 * abs(self.eR_ema) + 0.3 * delta_rank_abs)
+                    raw_healthy = (self.patience <= 3) and (unif_val < -1.2) and knn_ok
+                    if raw_healthy:
+                        self.healthy_streak += 1
+                    else:
+                        # Decay suave en lugar de reset total para evitar amnesia por un solo spike
+                        self.healthy_streak = max(0, self.healthy_streak - 1)
+                        
+                    # Histéresis: exigir 2 confirmaciones (anti-flapping)
+                    is_healthy_reorg = self.healthy_streak >= 2
+                    
+                    # Awareness de Fase y Modulación de Umbrales
+                    base_threshold = max(1.0, 0.7 * abs(self.eR_ema) + 0.3 * delta_rank_abs)
+                    if delta_rank_abs < 0.05 and drift < 0.15:
+                        phase = "Convergencia"
+                        adaptive_threshold = base_threshold * 1.2
+                        lr_recovery_rate = 1.02
+                    elif delta_rank_abs > 0.5:
+                        phase = "Reorganización"
+                        adaptive_threshold = base_threshold * 0.9
+                        lr_recovery_rate = 1.03
+                    else:
+                        phase = "Transición"
+                        adaptive_threshold = base_threshold
+                        lr_recovery_rate = 1.025
+                    
+                    is_crisis_raw = (delta_rank_abs > adaptive_threshold) and not is_healthy_reorg
+                    if is_crisis_raw:
+                        self.crisis_counter += 1
+                    else:
+                        if delta_rank_abs < 0.5:
+                            self.crisis_counter = 0
+                        else:
+                            self.crisis_counter = max(0, self.crisis_counter - 1)
+                    
+                    is_crisis = self.crisis_counter >= 2
                     
                     if delta_rank_abs > adaptive_threshold:
                         if is_healthy_reorg:
-                            self.logger.info(f"🧬 Reorganización Saludable: ΔRank alto ({delta_rank_abs:.4f}) pero KNN sano (U={unif_val:.2f}). Suprimiendo pánico.")
-                            self.crisis_counter = max(0, self.crisis_counter - 1)
-                        else:
-                            self.crisis_counter += 1
+                            self.logger.info(f"🧬 [{phase}] Reorganización Saludable: ΔRank alto ({delta_rank_abs:.4f}). Suprimiendo pánico.")
+                        elif is_crisis:
                             emergency_factor = math.exp(-1.5 * (delta_rank_abs - adaptive_threshold))
                             self.lr_scale *= emergency_factor
-                            self.logger.warning(f"⚡ Reflejo de Emergencia: Varianza extrema ({delta_rank_abs:.4f} > {adaptive_threshold:.4f}). Hachazo instantáneo al LR.")
-                    elif delta_rank_abs < 0.5:
-                        self.crisis_counter = max(0, self.crisis_counter - 1)
-                        
+                            self.logger.warning(f"⚡ [{phase}] Reflejo de Emergencia Confirmado: Varianza extrema ({delta_rank_abs:.4f}). Hachazo al LR.")
+                        else:
+                            self.logger.info(f"⚠️ [{phase}] Alerta temprana: Varianza alta ({delta_rank_abs:.4f}). Esperando confirmación...")
+                            
                     # MODO SUPERVIVENCIA ESTRUCTURAL (2da Ola de Crisis)
-                    if self.crisis_counter >= 2:
+                    if self.crisis_counter >= 3:
                         tau_boost = 0.02 * min(2.0, delta_rank_abs)
                         self.logger.warning(f"🚨 SEGUNDA OLA DE CRISIS DETECTADA. Control estructural (Tau +{tau_boost:.4f}).")
                         self.tau += tau_boost
@@ -372,8 +409,9 @@ class TrainingController:
                     if is_healthy_reorg:
                         # Fase de refinamiento sano: recuperar el LR si estaba castigado
                         if self.lr_scale < 1.0:
-                            recovery = min(1.0, self.lr_scale * 1.1)
-                            self.logger.info(f"🌱 Refinamiento confirmado. Recuperando LR_Scale: {self.lr_scale:.3f} -> {recovery:.3f}")
+                            recovery = min(1.0, self.lr_scale * lr_recovery_rate)
+                            if self.lr_scale < 0.99:
+                                self.logger.info(f"🌱 [{phase}] Refinamiento. Recuperando LR_Scale: {self.lr_scale:.3f} -> {recovery:.3f}")
                             self.lr_scale = recovery
                     else:
                         # Asimetría INTENCIONAL: la penalización (riesgo inminente) es 10x más
@@ -385,7 +423,8 @@ class TrainingController:
                             # Recuperación lenta y controlada (salida del colapso, 10x más lenta)
                             self.lr_scale *= math.exp(-0.1 * Kp_lr * eR_ctrl)
                         
-                    self.lr_scale = max(min(self.lr_scale, 1.0), 0.1)
+                    # Hard safety clamp: Garantiza que el aprendizaje nunca muera ni explote
+                    self.lr_scale = max(min(self.lr_scale, 1.0), 0.25)
                     self.lr_step_factor = self.lr_scale / old_scale if old_scale > 0 else 1.0
                     
                     self.logger.info(f"⚙️ PID: Tau={self.tau:.4f} | Mom={self.current_m:.5f} | LR_Scale={self.lr_scale:.3f} | TauRankCoef={self.tau_rank_coef:.3f}")
@@ -412,7 +451,7 @@ class TrainingController:
                     # No actuamos hasta tener al menos 3 activaciones con datos estables.
                     _geosat_mature = self.geosat_activations >= 3
                     
-                    if (delta_rank_abs > 0.6 and not is_healthy_reorg) or unif_val > -0.3:
+                    if (delta_rank_abs > 1.0 and not is_healthy_reorg) or unif_val > -0.3:
                         self.logger.warning(f"⚠️ DEGRADACIÓN SEVERA DETECTADA: ΔRank={delta_rank_abs:.4f}, U={unif_val:.2f}")
                         if not _geosat_mature:
                             self.logger.warning(f"   ↳ GeoSat en fase inicial (activación {self.geosat_activations}/3). Suprimiendo acción preventiva.")
@@ -533,6 +572,7 @@ class TrainingController:
             'tau_rank_coef': self.tau_rank_coef,
             'prev_tau': self.prev_tau,
             'crisis_counter': self.crisis_counter,
+            'healthy_streak': self.healthy_streak,
             'geosat_activations': self.geosat_activations,
         }
 
@@ -608,6 +648,7 @@ class TrainingController:
         self.tau_rank_coef = state.get('tau_rank_coef', 0.5)
         self.prev_tau = state.get('prev_tau', self.tau)
         self.crisis_counter = state.get('crisis_counter', 0)
+        self.healthy_streak = state.get('healthy_streak', 0)
         # Retrocompat: checkpoints anteriores no tienen este campo; por defecto 0
         # (el guard se re-activa correctamente durante el resume).
         self.geosat_activations = state.get('geosat_activations', 0)
