@@ -231,7 +231,11 @@ class TrainingController:
                     # 2. Diferencias con signo para detectar degradación explícita
                     diff_pos = avg_pos - self.prev_pos_sim
                     diff_neg = avg_neg - self.prev_neg_sim
-                    delta_rank_abs = abs(avg_rank - self.prev_eff_rank)
+                    # FIX: eff_rank es un valor absoluto (ej. ~50). Los umbrales del PID
+                    # (0.1 target, 0.6 emergencia) asumen valores normalizados [0, 1].
+                    # Lo convertimos a cambio relativo para que los umbrales tengan sentido.
+                    # Ejemplo: cambio de 1.5 en rank 50 -> delta_rank_abs = 0.03 (3% varianza).
+                    delta_rank_abs = abs(avg_rank - self.prev_eff_rank) / max(self.prev_eff_rank, 1e-8)
                     
                     delta_pos_abs = abs(diff_pos)
                     delta_neg_abs = abs(diff_neg)
@@ -316,22 +320,23 @@ class TrainingController:
                     Kp_lr = 0.5
                     old_scale = self.lr_scale
                     
+                    # Validar externamente si es crisis o refinamiento
+                    # Si KNN mejora o está estable (patience <= 1) y Uniformidad es buena (muy negativa)
+                    is_healthy_reorg = (self.patience <= 1) and (unif_val < -1.5)
+                    
                     # REFLEJO ESPINAL: Control reactivo bypass de emergencia
                     # Umbral adaptativo: Mayor peso al histórico (eR_ema) que al spike instantáneo.
-                    # Pesos 0.7/0.3: evita que un eR_ema alto por crisis previas eleve tanto el
-                    # umbral que el reflejo quede silenciado ante un spike real (retroalimentación positiva).
-                    # Error 4 fix: eR_ema es un error normalizado (puede ser negativo),
-                    # mientras que delta_rank_abs es siempre >= 0. Mezclarlos sin abs()
-                    # produce un threshold que disminuye cuando el controlador está bajo
-                    # presión negativa, silenciando el reflejo de emergencia justo cuando
-                    # más se necesita. abs() restaura la coherencia de unidades.
                     adaptive_threshold = max(0.7, 0.7 * abs(self.eR_ema) + 0.3 * delta_rank_abs)
                     
                     if delta_rank_abs > adaptive_threshold:
-                        self.crisis_counter += 1
-                        emergency_factor = math.exp(-1.5 * (delta_rank_abs - adaptive_threshold))
-                        self.lr_scale *= emergency_factor
-                        self.logger.warning(f"⚡ Reflejo de Emergencia: Varianza extrema ({delta_rank_abs:.4f} > {adaptive_threshold:.4f}). Hachazo instantáneo al LR.")
+                        if is_healthy_reorg:
+                            self.logger.info(f"🧬 Reorganización Saludable: ΔRank alto ({delta_rank_abs:.4f}) pero KNN sano (U={unif_val:.2f}). Suprimiendo pánico.")
+                            self.crisis_counter = max(0, self.crisis_counter - 1)
+                        else:
+                            self.crisis_counter += 1
+                            emergency_factor = math.exp(-1.5 * (delta_rank_abs - adaptive_threshold))
+                            self.lr_scale *= emergency_factor
+                            self.logger.warning(f"⚡ Reflejo de Emergencia: Varianza extrema ({delta_rank_abs:.4f} > {adaptive_threshold:.4f}). Hachazo instantáneo al LR.")
                     elif delta_rank_abs < 0.5:
                         self.crisis_counter = max(0, self.crisis_counter - 1)
                         
@@ -364,15 +369,21 @@ class TrainingController:
                         self.tau = max(min(self.tau, 0.25), 0.05)
                         
                     # CONTROL CONTINUO: PID latente estándar sobre el rank de varianza.
-                    # Asimetría INTENCIONAL: la penalización (riesgo inminente) es 10x más
-                    # agresiva que la recuperación (salida del colapso). Esto implementa
-                    # el principio de 'primero no hagas daño': se frena rápido, se libera despacio.
-                    if eR_ctrl > 0:
-                        # Penalización fuerte y rápida (riesgo inminente de colapso)
-                        self.lr_scale *= math.exp(-Kp_lr * eR_ctrl)
+                    if is_healthy_reorg:
+                        # Fase de refinamiento sano: recuperar el LR si estaba castigado
+                        if self.lr_scale < 1.0:
+                            recovery = min(1.0, self.lr_scale * 1.1)
+                            self.logger.info(f"🌱 Refinamiento confirmado. Recuperando LR_Scale: {self.lr_scale:.3f} -> {recovery:.3f}")
+                            self.lr_scale = recovery
                     else:
-                        # Recuperación lenta y controlada (salida del colapso, 10x más lenta)
-                        self.lr_scale *= math.exp(-0.1 * Kp_lr * eR_ctrl)
+                        # Asimetría INTENCIONAL: la penalización (riesgo inminente) es 10x más
+                        # agresiva que la recuperación (salida del colapso).
+                        if eR_ctrl > 0:
+                            # Penalización fuerte y rápida (riesgo inminente de colapso)
+                            self.lr_scale *= math.exp(-Kp_lr * eR_ctrl)
+                        else:
+                            # Recuperación lenta y controlada (salida del colapso, 10x más lenta)
+                            self.lr_scale *= math.exp(-0.1 * Kp_lr * eR_ctrl)
                         
                     self.lr_scale = max(min(self.lr_scale, 1.0), 0.1)
                     self.lr_step_factor = self.lr_scale / old_scale if old_scale > 0 else 1.0
@@ -401,7 +412,7 @@ class TrainingController:
                     # No actuamos hasta tener al menos 3 activaciones con datos estables.
                     _geosat_mature = self.geosat_activations >= 3
                     
-                    if delta_rank_abs > 0.6 or unif_val > -0.3:
+                    if (delta_rank_abs > 0.6 and not is_healthy_reorg) or unif_val > -0.3:
                         self.logger.warning(f"⚠️ DEGRADACIÓN SEVERA DETECTADA: ΔRank={delta_rank_abs:.4f}, U={unif_val:.2f}")
                         if not _geosat_mature:
                             self.logger.warning(f"   ↳ GeoSat en fase inicial (activación {self.geosat_activations}/3). Suprimiendo acción preventiva.")
