@@ -43,7 +43,8 @@ def run_linear_probe(encoder, train_ds, val_ds, num_classes, config, device):
     ]
 
     optimizer = torch.optim.AdamW(param_groups, lr=1e-3)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=25)
+    epochs = config.get('eval', {}).get('linear_probe_epochs', 25)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
     n_workers = config['training']['num_workers']
@@ -54,19 +55,37 @@ def run_linear_probe(encoder, train_ds, val_ds, num_classes, config, device):
     val_loader = DataLoader(val_ds, batch_size=128, shuffle=False,
                             num_workers=n_workers, pin_memory=True)
 
-    for epoch in range(25):
+    device_type = device.type if hasattr(device, 'type') else str(device).split(':')[0]
+    use_amp = config.get('training', {}).get('use_amp', False)
+    scaler = torch.amp.GradScaler(device_type, enabled=use_amp)
+
+    for epoch in range(epochs):
         classifier.train()
-        for x, y in train_loader:
+        total_loss = 0.0
+        
+        # Añadir tqdm para ver el progreso del batch
+        pbar = tqdm(train_loader, desc=f"Linear Probe Ep {epoch+1}/{epochs}", leave=False)
+        for x, y in pbar:
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
             with torch.no_grad():
-                # use_predictor=False: usar la cabeza del projector (256-dim), no el predictor
-                feats = F.normalize(encoder(x, use_predictor=False), dim=1)
-            loss = criterion(classifier(feats), y)
+                with torch.amp.autocast(device_type, enabled=use_amp):
+                    feats = F.normalize(encoder(x, use_predictor=False), dim=1)
+            
             optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            with torch.amp.autocast(device_type, enabled=use_amp):
+                out = classifier(feats)
+                loss = criterion(out, y)
+                
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            
+            total_loss += loss.item()
+            pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+            
         scheduler.step()
+        logger.info(f"Linear Probe Epoch {epoch+1}/{epochs} | Loss: {total_loss/len(train_loader):.4f}")
 
     classifier.eval()
     all_preds, all_labels = [], []

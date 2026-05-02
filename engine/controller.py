@@ -63,6 +63,9 @@ class EMA:
             self.value = self.beta * self.value + (1 - self.beta) * x
         return self.value
 
+    def reset(self):
+        self.value = None
+
 class TrainingController:
     """
     AAC v3 (Edición Industrial): Microscopio de Observabilidad.
@@ -291,9 +294,12 @@ class TrainingController:
                     
                     # Deadband (Zona Muerta) APLICADA DESPUÉS DEL EMA para evitar sesgos nulos
                     # (función definida a nivel de módulo para testabilidad y eficiencia)
-                    eU_ctrl = deadband(self.eU_ema, 0.1)
-                    eD_ctrl = deadband(self.eD_ema, 0.1)
-                    eR_ctrl = deadband(self.eR_ema, 0.05)
+                    db_u = self.config.get('controller', {}).get('deadband_u', 0.1)
+                    db_d = self.config.get('controller', {}).get('deadband_d', 0.1)
+                    db_r = self.config.get('controller', {}).get('deadband_r', 0.05)
+                    eU_ctrl = deadband(self.eU_ema, db_u)
+                    eD_ctrl = deadband(self.eD_ema, db_d)
+                    eR_ctrl = deadband(self.eR_ema, db_r)
                     
                     # Bandera para suspender el PID termostático si hay crisis
                     use_pid_tau = True
@@ -306,19 +312,20 @@ class TrainingController:
                         self.I_U *= 0.9 # Descarga rápida si cruza el target
                     self.I_U = max(min(self.I_U, 5.0), -5.0) # Clamp
                     
-                    Kp_tau = 0.02
-                    Ki_tau = Kp_tau / 50.0
+                    Kp_tau = self.config.get('controller', {}).get('Kp_tau', 0.02)
+                    Ki_tau_ratio = self.config.get('controller', {}).get('Ki_tau_ratio', 50.0)
+                    Ki_tau = Kp_tau / Ki_tau_ratio
                     # La actualización se realiza al final, si use_pid_tau es True
                     
                     
                     # --- Eje B: Freno de Inercia (Control P sobre Alpha) ---
-                    Kp_alpha = 0.005
+                    Kp_alpha = self.config.get('controller', {}).get('Kp_alpha', 0.005)
                     self.alpha -= Kp_alpha * eD_ctrl
                     self.alpha = max(min(self.alpha, 0.05), 1e-5) # Momentum [0.95, 0.99999]
                     self.current_m = 1.0 - self.alpha
                     
                     # --- Eje C: Amortiguador de LR Reversible ---
-                    Kp_lr = 0.5
+                    Kp_lr = self.config.get('controller', {}).get('Kp_lr', 0.5)
                     old_scale = self.lr_scale
                     
                     # Validar externamente si es crisis o refinamiento
@@ -346,16 +353,17 @@ class TrainingController:
                     if delta_rank_abs < 0.05 and drift < 0.15:
                         phase = "Convergencia"
                         adaptive_threshold = base_threshold * 1.2
-                        lr_recovery_rate = 1.02
+                        lr_recovery_rate = self.config.get('controller', {}).get('lr_recovery_rate', 1.025)
                     elif delta_rank_abs > 0.5:
                         phase = "Reorganización"
                         adaptive_threshold = base_threshold * 0.9
-                        lr_recovery_rate = 1.03
+                        lr_recovery_rate = self.config.get('controller', {}).get('lr_recovery_rate', 1.025) * 1.01
                     else:
                         phase = "Transición"
                         adaptive_threshold = base_threshold
-                        lr_recovery_rate = 1.025
+                        lr_recovery_rate = self.config.get('controller', {}).get('lr_recovery_rate', 1.025)
                     
+                    crisis_th = self.config.get('controller', {}).get('crisis_threshold', 2)
                     is_crisis_raw = (delta_rank_abs > adaptive_threshold) and not is_healthy_reorg
                     if is_crisis_raw:
                         self.crisis_counter += 1
@@ -365,7 +373,7 @@ class TrainingController:
                         else:
                             self.crisis_counter = max(0, self.crisis_counter - 1)
                     
-                    is_crisis = self.crisis_counter >= 2
+                    is_crisis = self.crisis_counter >= crisis_th
                     
                     if delta_rank_abs > adaptive_threshold:
                         if is_healthy_reorg:
@@ -378,7 +386,7 @@ class TrainingController:
                             self.logger.info(f"⚠️ [{phase}] Alerta temprana: Varianza alta ({delta_rank_abs:.4f}). Esperando confirmación...")
                             
                     # MODO SUPERVIVENCIA ESTRUCTURAL (2da Ola de Crisis)
-                    if self.crisis_counter >= 3:
+                    if self.crisis_counter >= crisis_th + 1:
                         tau_boost = 0.02 * min(2.0, delta_rank_abs)
                         self.logger.warning(f"🚨 SEGUNDA OLA DE CRISIS DETECTADA. Control estructural (Tau +{tau_boost:.4f}).")
                         self.tau += tau_boost

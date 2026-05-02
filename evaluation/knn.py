@@ -163,8 +163,7 @@ def fast_knn(X_train: np.ndarray, y_train: np.ndarray,
     num_classes = int(y_train.max()) + 1
     neighbor_labels = y_train[indices]  # [N_val, k]
     votes = np.zeros((len(X_val_norm), num_classes), dtype=np.int32)
-    for i in range(k):
-        votes[np.arange(len(X_val_norm)), neighbor_labels[:, i]] += 1
+    np.add.at(votes, (np.arange(len(X_val_norm))[:, None], neighbor_labels), 1)
 
     preds = votes.argmax(axis=1)
     return float(accuracy_score(y_val, preds))

@@ -196,7 +196,7 @@ def build_index(root, rank, cache_path):
                 pass
                 
         if rebuild:
-            files = sorted([str(f) for ext in ["*.jpg", "*.png", "*.jpeg", "*.JPG", "*.PNG"] for f in Path(root).rglob(ext)])
+            files = sorted([str(f) for ext in ["*.jpg", "*.png", "*.jpeg", "*.JPG", "*.PNG", "*.JPEG"] for f in Path(root).rglob(ext)])
             if len(files) == 0:
                 raise RuntimeError(f"No se encontraron imágenes en {root}")
             np.save(cache_path, files)

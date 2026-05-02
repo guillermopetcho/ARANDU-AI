@@ -46,3 +46,14 @@ eval:
 wandb:
   enabled: true
   project: "MoCo-ENCODER"
+
+controller:
+  Kp_tau: 0.02
+  Ki_tau_ratio: 50.0
+  Kp_alpha: 0.005
+  Kp_lr: 0.5
+  lr_recovery_rate: 1.025
+  crisis_threshold: 2
+  deadband_u: 0.1
+  deadband_d: 0.1
+  deadband_r: 0.05

@@ -190,11 +190,12 @@ class MoCoTrainer:
                 pos_sim_sum, neg_sim_sum, grad_norm_sum, float(grad_steps), float(valid_steps)
             ], device=self.device, dtype=torch.float32)
             dist.all_reduce(metrics_tensor, op=dist.ReduceOp.SUM)
-            metrics_tensor[:9] /= dist.get_world_size()
+            
             epoch_loss, pos_sum, neg_sum, align_sum, unif_sum, std_sum, \
                 pos_sim_sum, neg_sim_sum, grad_norm_sum, grad_steps, valid_steps = metrics_tensor.tolist()
             grad_steps = int(grad_steps)
-            num_steps = max(1, int(valid_steps / dist.get_world_size()))  # Promedio de valid_steps
+            # Usar la suma total de pasos en todos los procesos como denominador
+            num_steps = max(1, int(valid_steps))
 
         # I1 FIX: Monitorear integridad del dataset.
         # Se lee desde _load_errors.Value (compartido entre workers via multiprocessing)
@@ -219,7 +220,7 @@ class MoCoTrainer:
             'pos_sim': pos_sim_sum / num_steps,
             'neg_sim': neg_sim_sum / num_steps,
             'std': std_sum / num_steps,
-            'gn': grad_norm_sum / max(1, grad_steps),
+            'gn': grad_norm_sum / grad_steps if grad_steps > 0 else None,
             'tput': (len(loader) * self.config['training']['batch_size'] * (dist.get_world_size() if dist.is_initialized() else 1)) / max(1, time.time() - epoch_start),
             'data_err': error_rate
         }, global_step
