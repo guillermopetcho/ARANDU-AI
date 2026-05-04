@@ -1,96 +1,153 @@
-Este es un texto técnico, exhaustivo y de nivel profesional diseñado específicamente para servir como el cuerpo principal del archivo `README.md` en un repositorio de GitHub de clase industrial. Está estructurado para que cualquier reclutador o ingeniero senior de IA pueda entender la complejidad y el rigor del proyecto.
+La arquitectura de **ARANDU-AI (SojAI)** se basa en el paradigma **MoCo v3** (*Momentum Contrast version 3*), diseñado específicamente para el aprendizaje de representaciones visuales sin supervisión. Su estructura es una **Red Siamesa Asimétrica**, compuesta por dos ramas de procesamiento paralelas que interactúan para organizar un espacio latente de alta fidelidad.
+
+A continuación, se detalla cada componente y la lógica de ingeniería que sustenta este sistema.
+
+
+## 1. El Backbone: Extractor de Características ($f_\theta$)
+
+El "corazón" de la red es una **ResNet-50**, seleccionada por su equilibrio entre capacidad expresiva y eficiencia computacional en dispositivos de campo.
+
+* **Modificación Estructural:** Se elimina la capa completamente conectada final (`fc`). En su lugar, se utiliza un *Global Average Pooling* (GAP) que entrega un vector de **2048 dimensiones**.
+* **Función:** Transforma los píxeles de la imagen de soja en un tensor latente que contiene información morfológica, cromática y de textura.
+* **Dualidad:** Ambas ramas (Query y Key) comparten esta arquitectura base, aunque sus pesos evolucionan de manera distinta.
+
+
+
+
+
+## 2. El Proyector MLP ($g_\theta$)
+
+Ubicado inmediatamente después del backbone en ambas ramas, el proyector actúa como un "embudo" matemático que traslada el conocimiento general a un subespacio optimizado para el contraste.
+
+* **Arquitectura:** Consta de 3 capas densas (`Linear -> BatchNorm -> ReLU`).
+* **Reducción Dimensional:** Mapea las 2048 dimensiones del backbone a un espacio de **256 dimensiones**.
+* **Normalización $L_2$:** La salida final se normaliza para que el vector resulte en una magnitud de 1. Esto obliga al modelo a trabajar en la superficie de una **hiperesfera unitaria**, donde la similitud se mide puramente por el ángulo (similitud coseno) y no por la magnitud.
+
+
+
+
+
+## 3. El Predictor MLP ($q_\theta$): La Clave de la Asimetría
+
+Este componente es exclusivo de la **Red Query (Online)**. Es el bloque que rompe la simetría estructural y funcional del sistema.
+
+* **Propósito:** Su tarea es intentar "predecir" la representación que generará la red Key.
+* **Prevención de Colapso:** Al forzar esta asimetría, evitamos que las dos redes se pongan de acuerdo en una solución trivial (como devolver siempre ceros). La red Query debe trabajar activamente para mapear sus características hacia un objetivo móvil pero estable.
+
+
+
+## 4. Mecánica de Actualización: Rama Online vs. Momentum
+
+La arquitectura se divide en dos flujos de datos con regímenes de aprendizaje opuestos:
+
+| Característica | Rama Query (Online) | Rama Key (Target/Momentum) |
+| :--- | :--- | :--- |
+| **Entrada** | Vistas globales y locales | Solo vistas globales |
+| **Gradientes** | Sí (Backpropagation activo) | No (Gradientes desactivados) |
+| **Actualización** | Optimizador (ej. LARS o AdamW) | Media Móvil Exponencial (EMA) |
+| **Componentes** | Backbone + Proyector + Predictor | Backbone + Proyector |
+
+### Actualización por Momentum
+Los pesos de la red Key ($\theta_k$) no se calculan mediante el error, sino que "siguen" lentamente a los de la red Query ($\theta_q$) mediante la fórmula:
+
+$$\theta_k \leftarrow m\theta_k + (1 - m)\theta_q$$
+
+Donde **$m$** es el coeficiente de momentum (típicamente **0.999**). Esto garantiza que el diccionario de ejemplos negativos sea coherente y estable en el tiempo, evitando fluctuaciones ruidosas en la pérdida **InfoNCE**.
+
+
+
+
+
+## 5. El Lazo de Control Geométrico (GeoSat)
+
+Integrado en el flujo de entrenamiento, el módulo `controller.py` supervisa la arquitectura analizando la **matriz de covarianza** de las salidas de 256-d.
+
+* **Monitoreo de Varianza:** Si el controlador detecta que las dimensiones se están "apagando" (colapso dimensional), interviene ajustando la temperatura $\tau$ de la función de pérdida.
+* **Lógica PID:** Aplica correcciones proporcionales e integrales para mantener la entropía del espacio latente en niveles óptimos, asegurando que cada una de las 256 dimensiones aporte información útil para el diagnóstico fitopatológico.
+
+
+
+## 6. Salida y Evaluación Silenciosa
+
+La arquitectura está diseñada para que, tras el pre-entrenamiento, el backbone se "cristalice". 
+1.  **Monitor k-NN:** Evalúa la arquitectura buscando vecinos cercanos en el espacio de 256-d.
+2.  **Linear Probe:** Valida si un clasificador lineal simple puede separar las clases (Roya, Sano, Mancha) basándose únicamente en las características de la ResNet-50 congelada.
+
+Esta estructura modular permite que ARANDU-AI extraiga características de una hoja de soja con una fidelidad tal que, al finalizar, el modelo entiende la diferencia entre patógenos biológicamente similares mediante su **huella digital geométrica** en el espacio latente.
+
+
+
 
 ---
 
-# ARANDU-AI (SojAI): Sistema de Visión Computacional Autosupervisado para Fitopatología Digital
 
-## 1. Introducción y Propósito del Proyecto
-**ARANDU-AI** representa un hito en la aplicación de la Inteligencia Artificial al sector agropecuario. A diferencia de los sistemas tradicionales de clasificación que dependen de miles de etiquetas manuales (propensas al error humano y costosas de producir), ARANDU-AI implementa un paradigma de **Aprendizaje Autosupervisado (SSL)**. El sistema es capaz de "aprender" por sí mismo la morfología, texturas y patrones de las enfermedades de la soja, extrayendo representaciones latentes de alta fidelidad antes de siquiera ver una etiqueta de clase.
+Para que el núcleo de **ARANDU-AI** (el modelo MoCo v3) sea funcional en un entorno de producción industrial, requiere de una infraestructura periférica robusta. Esta "estructura alrededor de la arquitectura" es lo que transforma un algoritmo matemático en un sistema de ingeniería de software resiliente y escalable.
+
+Podemos dividir esta estructura en cinco pilares fundamentales:
 
 
+## 1. El Sistema de Ingesta Jerárquica (`utils/`)
+En el aprendizaje autosupervisado, el modelo no recibe "datos", recibe "relaciones". La estructura alrededor de la carga de datos está diseñada para forzar la **coherencia estructural**.
 
-El objetivo final es cristalizar un **Encoder Universal de Soja** que pueda ser desplegado en dispositivos de borde (Edge AI) para diagnósticos en tiempo real con una precisión superior al 95% utilizando solo una fracción de los datos etiquetados requeridos por otros modelos.
-
----
-
-## 2. El Motor Teórico: Momentum Contrast (MoCo v3) e InfoNCE
-El sistema se fundamenta en la arquitectura **MoCo v3**, que reformula el aprendizaje de imágenes como una tarea de búsqueda en un diccionario dinámico. El modelo aprende mediante la comparación de pares positivos (versiones aumentadas de la misma hoja) frente a un conjunto masivo de distractores (pares negativos).
-
-### 2.1 La Función de Pérdida InfoNCE
-Para organizar el espacio latente, utilizamos la pérdida **InfoNCE (Information Noise-Contrastive Estimation)**, la cual maximiza la información mutua entre representaciones:
-
-$$L_{q, k^+, \{k_i\}} = -\log \frac{\exp(q \cdot k^+ / \tau)}{\sum_{i=0}^{K} \exp(q \cdot k_i / \tau)}$$
-
-Donde $\tau$ es un parámetro de **Temperatura Dinámica** controlado por un scheduler térmico. Esta temperatura regula la concentración de los vectores en la hiperesfera unitaria, permitiendo que el modelo se enfoque en "ejemplos negativos difíciles" (hard negatives) durante las fases finales del entrenamiento.
+* **Orquestación Multi-Crop:** El sistema no carga una imagen, sino que dispara un generador de vistas. Produce simultáneamente vistas globales ($224 \times 224$) para el contexto y vistas locales ($96 \times 96$) para la textura.
+* **Pipeline de Invariancia:** La estructura de aumentaciones aplica transformaciones deterministas (como rotaciones del grupo $D_4$) y estocásticas (como el desenfoque gaussiano). Esto asegura que el "ruido" inyectado sea biológicamente plausible para una hoja de soja.
 
 
 
----
 
-## 3. Arquitectura Estructural: Redes Siamesas Asimétricas
-La implementación técnica en `models/moco.py` utiliza una arquitectura de doble rama con asimetría estructural para prevenir el colapso dimensional.
+## 2. El Lazo de Control y Resiliencia (`engine/`)
+Es el "sistema nervioso" del proyecto. Su función es monitorear, corregir y persistir el estado del entrenamiento.
 
-
-
-### 3.1 Backbone ResNet-50 Modificada
-Utilizamos una **ResNet-50** como extractor base. Hemos eliminado la capa totalmente conectada (`fc`) y la hemos sustituido por una capa de identidad para preservar un vector de características denso de 2048 dimensiones. Este vector captura desde gradientes de color (clorosis) hasta estructuras geométricas complejas (pústulas).
-
-
-
-### 3.2 Proyector y Predictor MLP
-El sistema mapea las 2048 dimensiones a un espacio de contraste de 256 dimensiones a través de un **Proyector MLP** de 3 capas. La rama **Query (Online)** incluye adicionalmente un **Predictor MLP**, que rompe la simetría y obliga a la red a predecir la representación de la rama **Key (Momentum)**, la cual se actualiza mediante una **Media Móvil Exponencial (EMA)** para garantizar la estabilidad del diccionario.
-
-
-
----
-
-## 4. Ingeniería de Datos y Pipeline Fitopatológico
-En SSL, las aumentaciones de datos son el equivalente a las etiquetas. El módulo `utils/` implementa una estrategia de **Multi-Crop** inspirada en DINO:
-
-1.  **Vistas Globales (224x224):** Capturan la arquitectura de la hoja y la disposición general de las lesiones.
-2.  **Vistas Locales (96x96):** Se enfocan en texturas microscópicas (esporas, halos necróticos).
-
-
-
-El pipeline aplica aumentaciones espaciales (rotaciones de 90° y flips) esenciales para imágenes cenitales, y un **Color Jittering** estrictamente controlado para no destruir la jerarquía biológica del color, vital en el diagnóstico fitopatológico.
-
-
-
----
-
-## 5. Innovación Crítica: Controlador Geométrico (GeoSat)
-Una de las contribuciones más audaces de ARANDU-AI es el módulo `engine/controller.py`. Este actúa como un sistema de soporte vital que monitorea la **entropía del espacio latente** en tiempo real.
-
-
-
-### 5.1 Lazo de Control PID
-Si el sistema detecta que el modelo está sufriendo un colapso dimensional (todos los vectores se parecen), GeoSat activa un bucle de control **PID (Proporcional-Integral-Derivativo)**:
-
-$$u(t) = K_p e(t) + K_i \int e(t) dt + K_d \frac{de(t)}{dt}$$
-
-El controlador ajusta la temperatura $\tau$ o inyecta un "shock térmico" para forzar la repulsión de los vectores, asegurando que el entrenamiento sea resiliente y autónomo. Incorpora además una lógica de **Histéresis (Anti-Flapping)** para ignorar ruidos momentáneos en los datos.
+### GeoSat (Controlador Geométrico)
+Esta es la capa de abstracción superior. Actúa como un supervisor de telemetría que:
+1.  **Analiza:** Extrae la matriz de covarianza de los embeddings en cada step.
+2.  **Calcula:** Evalúa el error de entropía latente.
+3.  **Actúa:** Ejecuta un comando PID para ajustar la temperatura ($\tau$) en el módulo de pérdida.
 
 
 
 [Image of PID controller block diagram]
 
 
-
-[Image of hysteresis loop]
-
-
----
-
-## 6. Protocolos de Evaluación y Calidad
-Para validar el progreso sin usar etiquetas durante el pre-entrenamiento, el sistema realiza "Evaluaciones Silenciosas":
-
-* **k-NN Monitor:** Busca los vecinos más cercanos en el espacio de 256-d para medir el agrupamiento natural de las enfermedades.
-* **Linear Probe:** Congela el Backbone y entrena una única capa lineal. Si el accuracy es alto, se demuestra que las características extraídas son **linealmente separables** y de alta fidelidad semántica.
+### Gestión de Persistencia (Checkpointing)
+Implementa una lógica de **Doble Buffer**. El sistema guarda el estado actual (`state_dict`) y mantiene una copia de seguridad de la época anterior. Esto garantiza que, ante un fallo de hardware o de suministro eléctrico, la recuperación ocurra en menos de 60 segundos sin corrupción de archivos.
 
 
+## 3. La Estructura de Memoria Latente (`MoCoQueue`)
+Debido a las limitaciones de VRAM (especialmente al trabajar con hardware como la RTX 4050), el sistema no puede procesar miles de imágenes por batch. La solución estructural es la **Cola de Memoria FIFO**.
+
+* **Desacoplamiento:** Separa el tamaño del diccionario de negativos del tamaño del batch de entrenamiento.
+* **Consistencia:** Almacena los vectores generados por la red *Momentum* en pasos anteriores.
+* **Actualización:** En cada iteración, los vectores nuevos entran y los más antiguos se descartan, manteniendo el "diccionario" fresco y alineado con la evolución del modelo.
 
 
----
+## 4. El Framework de Evaluación No Invasiva (`evaluation/`)
+Como el modelo es autosupervisado, la estructura incluye un pipeline de validación paralelo que no interfiere con el entrenamiento, pero proporciona métricas de negocio.
 
-## 7. Conclusión y Futuro
-ARANDU-AI no es solo un modelo; es un ecosistema de ingeniería diseñado para la resiliencia en el campo. Gracias al entrenamiento autosupervisado y al control geométrico, el sistema produce embeddings que son robustos ante cambios de iluminación, variedad de sensores y condiciones climáticas, estableciendo un nuevo estándar en la **Fitopatología Digital Inteligente**.
+* **k-NN Monitor:** Una estructura de datos de búsqueda rápida (basada en similitud coseno) que clasifica muestras de validación al vuelo para reportar el accuracy de "agrupamiento natural".
+* **Linear Probe Gate:** Un módulo que congela el backbone y entrena una capa lineal. Es la prueba de calidad que determina si el modelo está listo para ser "cristalizado" y pasar a la fase de fine-tuning.
+
+
+
+
+## 5. Orquestación Distribuida (DDP)
+Para escalar el entrenamiento, la estructura implementa **Distributed Data Parallel (DDP)**. Esto implica una lógica de comunicación entre procesos compleja:
+
+1.  **Sincronización de Gradientes:** Utiliza el algoritmo *All-Reduce* para promediar los pesos entre diferentes procesos.
+2.  **Broadcast de Cola:** Asegura que la `MoCoQueue` sea idéntica en todas las réplicas del modelo, evitando que cada instancia aprenda una geometría distinta.
+3.  **Manejo de Semillas:** Sincroniza la aleatoriedad de las aumentaciones para mantener la coherencia entre los pares positivos de cada GPU.
+
+
+### Resumen de la Estructura de Archivos
+Esta organización modular es lo que permite la mantenibilidad del proyecto:
+
+| Módulo | Responsabilidad Estructural |
+| :--- | :--- |
+| `models/` | Definición de la arquitectura siamesa y el proyector. |
+| `engine/` | Lógica de entrenamiento, bucles PID y control de fallos. |
+| `utils/` | Pipeline de aumentaciones y transformaciones fitopatológicas. |
+| `evaluation/` | Monitoreo de k-NN y pruebas de separabilidad lineal. |
+| `data/` | Gestión de datasets y loaders distribuidos. |
+
+Esta arquitectura sistémica asegura que el núcleo de IA esté protegido contra anomalías de datos, inestabilidades térmicas del gradiente y fallos de infraestructura, permitiendo un entrenamiento de grado industrial.
+
