@@ -1,5 +1,44 @@
 La arquitectura de **ARANDU-AI (SojAI)** se basa en el paradigma **MoCo v3** (*Momentum Contrast version 3*), diseñado específicamente para el aprendizaje de representaciones visuales sin supervisión. Su estructura es una **Red Siamesa Asimétrica**, compuesta por dos ramas de procesamiento paralelas que interactúan para organizar un espacio latente de alta fidelidad.
 
+
+## Referencias en el área del Deep Learning
+
+Este proyecto se fundamenta en las investigaciones más recientes en el campo del **Self-Supervised Learning (SSL)** y la visión computacional industrial. Para una comprensión profunda de la lógica subyacente, se recomienda la lectura de los siguientes artículos publicados en **arXiv**:
+
+### 1. Arquitectura de Contraste y Estabilidad
+* **MoCo v3 (Core Architecture):** *Chen, X., Xie, S., & He, K. (2021).* **An Empirical Study of Training Self-Supervised Vision Transformers.** Define la estructura de redes siamesas asimétricas, el uso del Predictor Head y las técnicas de estabilidad para el entrenamiento de backbones.  
+     [arXiv:2104.02057](https://arxiv.org/abs/2104.02057)
+
+* **Momentum Contrast (Concepto Original):** *He, K., Fan, H., Wu, Y., Xie, S., & Girshick, R. (2019).* **Momentum Contrast for Unsupervised Visual Representation Learning.** Introduce el mecanismo de actualización por momentum ($\theta_k \leftarrow m\theta_k + (1-m)\theta_q$) fundamental para la estabilidad del diccionario.  
+     [arXiv:1911.05722](https://arxiv.org/abs/1911.05722)
+
+### 2. Fundamentos Teóricos y Función de Pérdida
+* **InfoNCE & Predictive Coding:** *Oord, A. v. d., Li, Y., & Vinyals, O. (2018).* **Representation Learning with Contrastive Predictive Coding.** Documento fundacional de la pérdida InfoNCE. Explica la maximización del límite inferior de la Información Mutua (MI) entre representaciones latentes.  
+     [arXiv:1807.03748](https://arxiv.org/abs/1807.03748)
+
+### 3. Ingeniería de Datos y Extracción de Características
+* **Multi-Crop Strategy:** *Caron, M., et al. (2021).* **Emerging Properties in Self-Supervised Vision Transformers.** Respalda la lógica de vistas Globales vs. Locales integrada en el pipeline de ARANDU-AI para capturar jerarquías fitopatológicas.  
+     [arXiv:2104.14294](https://arxiv.org/abs/2104.14294)
+
+* **Deep Residual Learning (ResNet):** *He, K., Zhang, X., Ren, S., & Sun, J. (2015).* **Deep Residual Learning for Image Recognition.** Arquitectura base del Backbone utilizado en el proyecto para la extracción de características profundas.  
+     [arXiv:1512.03385](https://arxiv.org/abs/1512.03385)
+
+### 4. Guía de Implementación Industrial
+* **The SSL Cookbook:** *Balestriero, R., et al. (2023).* **A Cookbook of Self-Supervised Learning.** Compendio técnico sobre hiperparámetros, aumentaciones y optimizadores (LARS/AdamW) para la transición de modelos teóricos a sistemas de producción.  
+     [arXiv:2304.12210](https://arxiv.org/abs/2304.12210)
+
+
+##  Innovaciones Propias
+ARANDU-AI introduce componentes propietarios críticos para el dominio agrícola:
+
+* **GeoSat (Controlador Geométrico):** Implementación de un lazo de control cerrado basado en lógica PID para la termoregulación de la latencia y prevención de colapso dimensional.
+* **Pipeline Fitopatológico:** Calibración específica de aumentaciones cromáticas para preservar la sensibilidad diagnóstica (Clorosis vs. Necrosis).
+
+
+
+---
+
+
 A continuación, se detalla cada componente y la lógica de ingeniería que sustenta este sistema.
 
 
